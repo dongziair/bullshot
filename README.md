@@ -2,7 +2,30 @@
 
 Python 3.10+。默认维护 **100 个本地钱包**，邀请码默认 `0x75527f54`，对应[邀请链接](https://gem.bullshot.io/r/0x75527f54)。注册登录请求发送 `refCode: "0x75527f54"`。首次成功登录即按服务端规则注册，后续启动复用同一个钱包文件，不会每次重建地址。
 
-## 运行（Linux 服务器）
+## Linux 一键启动（推荐）
+
+解压完整脚本包后，在该目录只需执行：
+
+```bash
+bash start.sh
+```
+
+自动创建 `.venv`、安装依赖，然后在后台运行：100 个钱包，邀请码 `0x75527f54`，自动注册、签到和挖矿。关闭 SSH 不影响运行，再次执行不会重复启动。依赖未变化且环境可用时，不会重复联网安装。钱包仍先保存到本地，之后才发出注册请求；已有钱包直接复用。
+
+需要 Linux 和 Python 3.10+；Ubuntu/Debian 以 root 运行时会自动补装缺少的 Python/venv。不会要求浏览器、钱包扩展或扫码。
+
+可选命令：
+
+```bash
+bash start.sh logs       # 持续查看日志，Ctrl+C 仅退出日志查看
+bash start.sh status     # 查看进程状态
+bash start.sh stop       # 保存状态并停止
+bash start.sh --resume   # 修正暂停原因后重启；若仍在运行，先 stop
+```
+
+Linux 启动器只确认后台进程已经启动，不把“启动成功”当作“全部账号已注册/正在挖矿”。实际结果看日志；找不到 5/60 矿洞时仍按下文规则暂停新开工。
+
+## 手动运行（可选）
 
 将 `bull_gems.py`、`requirements.txt` 放进服务器上的同一目录，然后：
 
@@ -83,7 +106,7 @@ python bull_gems.py --wallets 100
 直接匿名读取矿洞接口返回 403，未实际生成生产钱包、注册账号、绑定邀请或挖矿。实际 API 的返回和权限仍需在你的服务器运行时确认。测试使用公开的确定性测试私钥、模拟 HTTP，不访问真实注册服务：
 
 ```bash
-python -m unittest -v test_bull_gems
+python -m unittest -v test_bull_gems test_start_sh
 ```
 
 本地测试依赖版本：`eth-account 0.13.7`、`requests 2.32.5`。

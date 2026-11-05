@@ -3,3 +3,5 @@ __pycache__/
 bull_gems_data/
 *.log
 .test-bull-gems-*/
+bull_gems.pid
+.bull_gems_start.lock
