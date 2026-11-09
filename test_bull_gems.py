@@ -116,14 +116,41 @@ class ApiTests(unittest.TestCase):
             api.request("GET", "/user/me")
         self.assertEqual(len(api.session.calls), 5)
 
-    def test_referral_missing_prevents_replaying_mutation(self):
+    def test_referral_missing_does_not_block_mutation_after_reauthentication(self):
         api = self.api([
             Response(status=401), Response({"nonce": "n"}), Response({"token": "fresh"}),
-            Response({"referredBy": None}),
+            Response({"referredBy": None}), Response({"ok": True}),
         ], token="old")
-        with self.assertRaises(bg.WalletPaused):
-            api.request("POST", "/mining/positions", {"locationId": "mine"})
-        self.assertEqual(len(api.session.calls), 4)
+        self.assertEqual(api.request("POST", "/mining/positions", {"locationId": "mine"}), {"ok": True})
+        self.assertEqual(len(api.session.calls), 5)
+        self.assertEqual(api.session.calls[-1][2]["headers"]["Authorization"], "Bearer fresh")
+
+    def test_unconfirmed_referral_keeps_valid_token_for_mining(self):
+        api = self.api([
+            Response({"nonce": "n"}), Response({"token": "unbound-token"}),
+            Response({"referredBy": None}),
+        ])
+        api.login()
+        self.assertEqual(api.state["token"], "unbound-token")
+        self.assertEqual(api.state["referral_status"], "empty")
+        self.assertEqual(api.session.calls[1][2]["json"]["refCode"], "0x75527f54")
+
+    def test_referral_missing_and_empty_are_distinguished_without_blocking(self):
+        api = self.api([], token="valid-token")
+        cases = [({}, "missing"), ({"referredBy": None}, "empty"), ({"referredBy": "  "}, "empty"), ({"referredBy": "referrer"}, "present")]
+        for me, expected in cases:
+            with self.subTest(status=expected):
+                self.assertEqual(api.verify_referral(me), expected == "present")
+                self.assertEqual(api.state["referral_status"], expected)
+                self.assertEqual(api.state["token"], "valid-token")
+
+    def test_referral_warning_is_not_repeated_on_every_poll(self):
+        api = self.api([], token="valid-token")
+        with self.assertLogs(bg.LOG, level="WARNING") as logs:
+            for _ in range(3):
+                self.assertFalse(api.verify_referral({"referredBy": None}))
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("quests and mining continue", logs.output[0])
 
     def test_unexpected_message_is_not_signed(self):
         api = self.api([Response({"message": "Send all tokens"})])
@@ -253,9 +280,11 @@ class StorageTests(unittest.TestCase):
 
 
 class FakeMiningApi:
-    verify_referral = staticmethod(bg.Api.verify_referral)
+    verify_referral = bg.Api.verify_referral
 
-    def __init__(self):
+    def __init__(self, wallet, state):
+        self.wallet = wallet
+        self.state = state
         self.calls = []
         self.energy = 10
         self.me = {"referredBy": "yes", "level": 1, "energy": 10, "miningPower": 0}
@@ -295,7 +324,7 @@ class MinerTests(unittest.TestCase):
         args = SimpleNamespace(ref_code=bg.REF_CODE, interval=15, skip_quests=True, location_id=None)
         self.miner = bg.Miner(wallet(), folder, Gate(), args)
         self.miner.api.session.close()
-        self.api = self.miner.api = FakeMiningApi()
+        self.api = self.miner.api = FakeMiningApi(self.miner.wallet, self.miner.state)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -332,10 +361,32 @@ class MinerTests(unittest.TestCase):
         self.assertIn("last_error", self.miner.state)
         self.assertFalse(any(m == "POST" for m, _, _ in self.api.calls))
 
-    def test_missing_referral_prevents_all_mutations(self):
+    def test_empty_referral_does_not_block_mining(self):
         self.api.me["referredBy"] = None
-        self.assertGreaterEqual(self.miner.tick(), 300)
-        self.assertEqual(len(self.api.calls), 1)
+        self.assertEqual(self.miner.tick(), 0.5)
+        self.assertEqual(self.api.open_attempts, 1)
+        self.assertEqual(self.miner.state["referral_status"], "empty")
+        self.assertNotIn("retry_at", self.miner.state)
+
+    def test_omitted_referral_does_not_block_quests_or_mining(self):
+        self.api.me.pop("referredBy")
+        self.miner.args.skip_quests = False
+        self.api.quests = {"daily": [{"id": "daily_miner_signin", "status": "ready"}]}
+        self.assertEqual(self.miner.tick(), 0.5)
+        self.assertEqual(self.api.open_attempts, 1)
+        self.assertIn(("POST", "/quests/claim", {"questId": "daily_miner_signin", "tweetUrl": ""}), self.api.calls)
+        self.assertEqual(self.miner.state["referral_status"], "missing")
+        self.assertNotIn("retry_at", self.miner.state)
+
+    def test_old_referral_pause_automatically_resumes_mining(self):
+        self.api.me["referredBy"] = None
+        self.miner.state.update({"token": "cached-token", "paused_reason": "referredBy is empty", "last_error": "referredBy is empty", "retry_at": 9999999999})
+        self.assertEqual(self.miner.tick(), 0.5)
+        self.assertEqual(self.api.open_attempts, 1)
+        self.assertEqual(self.miner.state["token"], "cached-token")
+        self.assertNotIn("paused_reason", self.miner.state)
+        self.assertNotIn("last_error", self.miner.state)
+        self.assertNotIn("retry_at", self.miner.state)
 
     def test_unexpected_exception_is_retried_without_logging_secrets(self):
         with patch.object(self.miner, "cycle", side_effect=[ValueError("SECRET-DO-NOT-LOG"), 15]), self.assertLogs(bg.LOG, level="WARNING") as logs:

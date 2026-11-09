@@ -321,10 +321,26 @@ class Api:
             except ValueError:
                 raise ShapeError("API returned non-JSON success response") from None
 
-    @staticmethod
-    def verify_referral(me: dict) -> None:
-        if not me.get("referredBy") or (isinstance(me["referredBy"], str) and not me["referredBy"].strip()):
-            raise WalletPaused("referredBy is empty; no quest or mining requests were allowed")
+    def verify_referral(self, me: dict) -> bool:
+        # Referral confirmation is informational, never a prerequisite for mining.
+        if "referredBy" not in me:
+            status = "missing"
+        elif not me["referredBy"] or (isinstance(me["referredBy"], str) and not me["referredBy"].strip()):
+            status = "empty"
+        else:
+            status = "present"
+        previous = self.state.get("referral_status")
+        self.state["referral_status"] = status
+        if status == "present":
+            self.state["referral_checked_at"] = utc_now()
+            if previous in ("missing", "empty"):
+                LOG.info("%s referral now confirmed", self.wallet["address"])
+            return True
+        self.state.pop("referral_checked_at", None)
+        if previous != status:
+            detail = "not returned by /user/me" if status == "missing" else "empty"
+            LOG.warning("%s referredBy %s; referral unconfirmed; quests and mining continue", self.wallet["address"], detail)
+        return False
 
     def login(self) -> None:
         nonce = as_object(self.raw("POST", "/auth/nonce", {"walletAddress": self.wallet["address"]}, auth=False))
@@ -345,12 +361,10 @@ class Api:
         if not isinstance(token, str) or not token.strip():
             raise ShapeError("Login response has no token")
         self.state["token"] = token
-        self.save()
         me = as_object(self.raw("GET", "/user/me"), "user")
-        self.verify_referral(me)
-        self.state["referral_checked_at"] = utc_now()
+        referral_confirmed = self.verify_referral(me)
         self.save()
-        LOG.info("%s login OK; referral present", self.wallet["address"])
+        LOG.info("%s login OK; referral %s", self.wallet["address"], "present" if referral_confirmed else "unconfirmed (not blocking)")
 
     def request(self, method: str, path: str, body=None):
         if not self.state.get("token"):

@@ -1,6 +1,6 @@
 {
-  "last_turn_at": "2026-11-09T03:00:54.903Z",
-  "turn_count": 11,
-  "last_progress_at": "2026-11-09T03:00:54.903Z",
-  "last_agent_output": "已改好：[下载更新脚本包](D:/个人/bullshot/bull_gems.zip)。\n\n启动仍然是：\n```bash\nbash start.sh\n```\n\n- 在**当前窗口**持续运行，日志直接"
+  "last_turn_at": "2026-11-09T03:36:05.245Z",
+  "turn_count": 14,
+  "last_progress_at": "2026-11-09T03:36:05.245Z",
+  "last_agent_output": "已改好：[下载更新包](D:/个人/bullshot/bull_gems.zip)。\n\n现在的逻辑：\n- 登录仍提交邀请码 `0x75527f54`。\n- **邀请为空或无法确认，只提示，不阻塞签到和"
 }
