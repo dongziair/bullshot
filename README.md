@@ -1,52 +1,65 @@
 # Bull Gems Python 链下客户端
 
-Python 3.10+。默认维护 **100 个本地钱包**，邀请码默认 `0x75527f54`，对应[邀请链接](https://gem.bullshot.io/r/0x75527f54)。注册登录请求发送 `refCode: "0x75527f54"`。首次成功登录即按服务端规则注册，后续启动复用同一个钱包文件，不会每次重建地址。
+Python 3.10+。**生成钱包与读取运行分成两步**，钱包数量由生成脚本控制，统一保存到脚本目录的 `wallet.json`。邀请码默认 `0x75527f54`，对应[邀请链接](https://gem.bullshot.io/r/0x75527f54)。首次成功登录即按服务端规则注册。
 
-## Linux 一键启动（推荐）
+## Linux 两步运行
 
-解压完整脚本包后，在该目录只需执行：
+解压完整脚本包后，在该目录执行：
+
+### 第一步：生成钱包
+
+```bash
+bash generate_wallets.sh 100
+```
+
+把 `100` 改成需要的数量（1～10000）。只生成地址和私钥并保存到 **`wallet.json`**，不调用注册、登录或挖矿接口；首次准备环境时可能需要从 pip 源安装依赖。完成后脚本退出，不会启动后台进程。
+
+数量表示**目标总数**：已有 100 个时再次传入 100 不变，传入 150 只追加 50 个；不允许传入较小数量来删除已有私钥。调整数量前先 `bash start.sh stop`。
+
+旧版用户：如果 `wallet.json` 尚不存在，但 `bull_gems_data/wallets.json` 存在，生成步骤会先复用旧文件的全部地址和私钥，再按目标总数补齐；旧文件不会删除或修改。若只剩状态文件而私钥文件丢失，则拒绝重建。
+
+### 第二步：读取钱包并后台循环运行
 
 ```bash
 bash start.sh
 ```
 
-自动创建 `.venv`、安装依赖，然后在后台运行：100 个钱包，邀请码 `0x75527f54`，自动注册、签到和挖矿。关闭 SSH 不影响运行，再次执行不会重复启动。依赖未变化且环境可用时，不会重复联网安装。钱包仍先保存到本地，之后才发出注册请求；已有钱包直接复用。
+只读取 **`wallet.json` 中实际存在的全部钱包**，然后后台注册、签到和挖矿。运行脚本绝不生成、补齐或覆盖钱包，也不会写回私钥文件；缺少文件时会提示先执行第一步。邀请码为 `0x75527f54`。关闭 SSH 不影响运行，再次执行不会重复启动。
+
+两个入口共享独立 `.venv` 环境；依赖未变化且环境可用时，不会重复联网安装。
+
+**后台持续循环，日志只在启动窗口打印，不创建或追加任何日志文件。** 关闭窗口后进程继续运行，但不保存或补打历史日志；要把后续输出切换到新窗口，先 `bash start.sh stop`，再 `bash start.sh`。旧版本已经生成的日志文件不会被本版修改或删除。
 
 需要 Linux 和 Python 3.10+；Ubuntu/Debian 以 root 运行时会自动补装缺少的 Python/venv。不会要求浏览器、钱包扩展或扫码。
 
 可选命令：
 
 ```bash
-bash start.sh logs       # 持续查看日志，Ctrl+C 仅退出日志查看
 bash start.sh status     # 查看进程状态
 bash start.sh stop       # 保存状态并停止
-bash start.sh --resume   # 修正暂停原因后重启；若仍在运行，先 stop
 ```
+
+普通网络错误、API 错误、单钱包异常会自动退避重试，不再因全部钱包失败而结束进程；启动和调度异常也会每 30 秒重试。单钱包失败不影响其他钱包，旧版 `paused_reason` 会自动重新检查，无需 `--resume`。403/字段异常至少冷却 5 分钟后复查，仍不会跳过签名、邀请关系、矿位上限等检查。
 
 Linux 启动器只确认后台进程已经启动，不把“启动成功”当作“全部账号已注册/正在挖矿”。实际结果看日志；找不到 5/60 矿洞时仍按下文规则暂停新开工。
 
 ## 手动运行（可选）
 
-将 `bull_gems.py`、`requirements.txt` 放进服务器上的同一目录，然后：
+Shell 入口会自动准备环境。需要手动调用 Python 时：
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 
-# 第一步：只生成和保存钱包，不发出任何 HTTP 请求
-python bull_gems.py --wallets 100 --init-only
+# 第一步：只生成和保存钱包
+python bull_gems.py --init-only --wallets 100 --wallet-file wallet.json
 
-# 先自行保管 bull_gems_data/wallets.json，再启动注册、签到和挖矿
-python bull_gems.py --wallets 100
+# 第二步：只读取钱包并循环运行
+python bull_gems.py --wallet-file wallet.json
 ```
 
-后台运行：
-
-```bash
-nohup .venv/bin/python -u bull_gems.py --wallets 100 > bull_gems.log 2>&1 &
-tail -f bull_gems.log
-```
+需要后台运行时，使用上面的一键启动器 `bash start.sh`，不要添加 `> 文件名`、`tee` 等日志文件重定向。
 
 使用 `Ctrl+C` 或 `SIGTERM` 退出；再次运行相同命令即可续跑。默认数据目录跟随脚本位置，而不是当前工作目录。可用 `--data-dir /your/private/directory` 显式指定，后续始终使用同一目录。
 
@@ -55,46 +68,57 @@ Windows：用 `python -m venv .venv` 创建环境，通过 `.venv\Scripts\python
 ## 本地文件
 
 ```text
+wallet.json             # 全部地址 + private_key，仅生成步骤创建/追加
 bull_gems_data/
-  wallets.json          # address + private_key，包含全部钱包的明文私钥
   state/<address>.json  # bearer token、任务计时、最近能量、暂停/开工状态
   client.lock           # 阻止同一数据目录被两份进程同时使用
 ```
 
-- 钱包在任何注册请求前原子落盘；损坏、地址不匹配或丢失钱包文件时停止，不静默覆盖。
+- 生成步骤把钱包原子落盘；运行步骤只读取并校验。损坏、地址不匹配或丢失钱包文件时，不发送注册请求、不静默覆盖或重建。后台客户端会等待后重读，启动器也会提前检查文件是否存在。
 - Linux 数据目录权限为 `0700`，新建私钥和状态文件为 `0600`。Windows 文件权限继承所在目录的 ACL。
 - 私钥只用于本地 `personal_sign`，不上传，不输出到日志；发出的登录数据只有地址、签名、message 和邀请码。状态文件中的 token 同样需自行保管。
 - 私钥使用 `Account.create()` 的随机源产生；保存后重启复用。随机新地址与既有地址碰撞的概率极低，但客户端无法独立证明某地址在服务端从未注册过。
-- 增大 `--wallets` 只会追加钱包；不能用较小数字忽略已有钱包。不要删除钱包文件来“重试”。
+- 只有生成步骤可使用 `--wallets`；运行步骤按文件中的实际数量运行，不能用 `--wallets` 生成或补齐。不要删除钱包文件来“重试”。
+
+### 私钥保存与后期导出
+
+全部私钥集中保存在脚本目录的 **`wallet.json`**，生成及启动时会打印绝对路径。后期直接复制或下载这个 JSON 文件即可，字段格式如下（仅为占位示例）：
+
+```json
+{
+  "version": 1,
+  "wallets": [
+    {"address": "0x...", "private_key": "0x...", "created_at": "..."}
+  ]
+}
+```
+
+该文件可被其他 Python 脚本直接读取，`wallets` 数组中每条记录就是一组地址和私钥。运行窗口不会打印实际私钥。
 
 ## 执行逻辑
 
 1. 取得 nonce，只签署以 `Sign in to Bull GEM on Base: ` 开头的登录消息。
-2. 带 `refCode` 登录；读取 `/user/me` 并要求 `referredBy` 非空，空值则暂停该钱包，不做任务或挖矿。该检查确认存在上级关系，不单凭非空字段宣称已核对上级的具体身份。
+2. 带 `refCode` 登录；读取 `/user/me` 并要求 `referredBy` 非空，空值则等待后重新检查，不做任务或挖矿。该检查确认存在上级关系，不单凭非空字段宣称已核对上级的具体身份。
 3. 请求均携带 `Authorization: Bearer <token>` 和 `X-Wallet-Address`。401 重新登录后仅重试原请求一次；登录仍失败则退避，不死循环。
 4. 用 `GET /quests` 查询服务端任务状态，只处理 `daily_miner_signin`、`weekly_miner_checkin`，跳过其他任务及 X/Twitter 平台任务。启动后至少等 10 秒，服务端要求更长则等更长。已领取任务每 5 分钟重新查询，是否重置以服务端为准，不猜时区。
 5. 先领取所有 `ready` 矿位；也识别前端可领取的 `completed` 状态。之后刷新矿位、读取 `/mining/stats` 的实时能量；能量不少于 5 且未领取矿位少于 5 个时，每轮再开一个。
 6. 只选择 API **实际返回**、符合等级/算力条件的 **5 能量、60 秒** 矿洞。没有匹配项时保留领取和签到，暂停新开工，**不自动改选更贵矿洞**。
-7. 通常空闲等待 15 秒；任务倒计时可提前唤醒。默认并发 3 个钱包、全局请求间隔至少 0.25 秒。100 个钱包共享额度，单个钱包实际轮询间隔可能超过 15 秒；不保证矿位满 60 秒时立即领取。
-8. 429 全局遵守 `Retry-After`，其他网络错误指数退避。403/重定向/关键字段变化会暂停该钱包，不轮换代理或尝试绕过访问限制。
+7. 通常空闲等待 15 秒；任务倒计时可提前唤醒。默认并发 3 个钱包、全局请求间隔至少 0.25 秒。全部钱包共享额度，单个钱包实际轮询间隔可能超过 15 秒；不保证矿位满 60 秒时立即领取。
+8. 429 全局遵守 `Retry-After`，其他网络错误指数退避。403/重定向/关键字段变化会等待至少 5 分钟后重查该钱包，不轮换代理或尝试绕过访问限制。未知异常和状态文件保存失败也不会使整个循环结束。
 
 该脚本没有 RPC、交易构造、链上签名、授权、充值或提现代码；只调用列出的 HTTPS 接口，不使用浏览器、钱包扩展或二维码。
 
 ## 故障恢复
 
-日志只显示地址、动作和 HTTP 状态，不显示响应正文、token 或私钥。暂停原因写入对应 `state/<address>.json` 的 `paused_reason`。
+日志仅输出到启动窗口，只显示地址、动作和 HTTP 状态，不显示响应正文、token 或私钥。可保存状态时，最近错误和重试时间记录在对应 `state/<address>.json` 的 `last_error`、`retry_at` 中；这是运行状态，不是日志文件。保存失败时保留内存状态并继续重试。读取失败的状态文件不会被空状态覆盖，修复后自动重新加载。
 
-修正邀请码、接口字段或访问问题后，可重试已暂停的钱包：
+正常运行不需要手动恢复，`--resume` 仅作为旧命令的兼容选项保留。主动执行 `bash start.sh stop` 或向进程发送 SIGTERM 才会正常结束循环。`--init-only`、`--clear-pending` 仍是执行一次即退出的维护命令。
 
-```bash
-python bull_gems.py --wallets 100 --resume
-```
-
-`--resume` 不会自动清除 `pending_open`。开工 POST 如果超时或返回 5xx，服务端可能已接收，所以脚本先查询矿位，不直接重复开工；发现新矿位后自动解除。如果始终无法确认，只暂停该钱包的新开工，已有矿位仍可领取。人工核对服务端确定无需保留标记后，先停止运行进程，再执行：
+不会自动清除 `pending_open`。开工 POST 如果超时或返回 5xx，服务端可能已接收，所以脚本先查询矿位，不直接重复开工；发现新矿位后自动解除。如果始终无法确认，只暂停该钱包的新开工，主循环仍继续，已有矿位仍可领取。人工核对服务端确定无需保留标记后，先停止运行进程，再执行：
 
 ```bash
 python bull_gems.py --clear-pending 0xYour40HexCharacterWalletAddress
-python bull_gems.py --wallets 100
+bash start.sh
 ```
 
 其他选项：`--workers 3`、`--interval 15`、`--request-interval 0.25`、`--skip-quests`、`--location-id ID`、`--ref-code CODE`。显式指定矿洞 ID 仍要求它符合 5/60 条件。

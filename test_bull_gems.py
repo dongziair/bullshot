@@ -1,5 +1,7 @@
 """Offline-only tests: deterministic public test keys, mocked HTTP, no registration."""
 
+import itertools
+import logging
 import tempfile
 import threading
 import unittest
@@ -187,9 +189,60 @@ class StorageTests(unittest.TestCase):
         with local_temp() as directory:
             account = Account.from_key((1).to_bytes(32, "big"))
             with patch.object(bg.Account, "create", return_value=account), patch.object(bg.requests, "Session") as session, patch.object(bg.signal, "signal"):
-                result = bg.main(["--wallets", "1", "--data-dir", directory, "--init-only"])
+                result = bg.main(["--wallets", "1", "--wallet-file", str(Path(directory) / "wallet.json"), "--data-dir", directory, "--init-only"])
             self.assertEqual(result, 0)
             session.assert_not_called()
+
+    def test_generation_uses_wallet_json_and_only_appends_to_target_total(self):
+        with local_temp() as directory:
+            root = Path(directory)
+            folder = root / "data"
+            bg.secure_directory(folder)
+            path = root / "wallet.json"
+            accounts = [Account.from_key(i.to_bytes(32, "big")) for i in range(1, 4)]
+            with patch.object(bg.Account, "create", side_effect=accounts[:2]):
+                first = bg.ensure_wallets(folder, 2, path)
+            with patch.object(bg.Account, "create", return_value=accounts[2]) as create:
+                larger = bg.ensure_wallets(folder, 3, path)
+            self.assertEqual(larger[:2], first)
+            self.assertEqual(len(larger), 3)
+            create.assert_called_once_with()
+            before = path.read_bytes()
+            with self.assertRaises(bg.WalletPaused):
+                bg.ensure_wallets(folder, 1, path)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_generation_migrates_legacy_keys_without_replacing_them(self):
+        with local_temp() as directory:
+            root = Path(directory)
+            folder = root / "bull_gems_data"
+            bg.secure_directory(folder)
+            legacy = folder / "wallets.json"
+            bg.write_json(legacy, {"version": 1, "wallets": [wallet(1), wallet(2)]})
+            before = legacy.read_bytes()
+            with patch.object(bg.Account, "create", side_effect=AssertionError("must reuse legacy keys")):
+                result = bg.ensure_wallets(folder, 2, root / "wallet.json")
+            self.assertEqual(result, [wallet(1), wallet(2)])
+            self.assertEqual(bg.load_wallets(root / "wallet.json"), result)
+            self.assertEqual(legacy.read_bytes(), before)
+
+    def test_loading_wallets_is_read_only_and_never_generates(self):
+        with local_temp() as directory:
+            path = Path(directory) / "wallet.json"
+            bg.write_json(path, {"version": 1, "wallets": [wallet(1), wallet(2)]})
+            before = path.read_bytes()
+            with patch.object(bg.Account, "create", side_effect=AssertionError("runtime must not generate")):
+                self.assertEqual(bg.load_wallets(path), [wallet(1), wallet(2)])
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_missing_wallet_file_is_not_created_on_read(self):
+        with local_temp() as directory:
+            path = Path(directory) / "wallet.json"
+            with patch.object(bg.Account, "create") as create:
+                with self.assertRaises(bg.WalletPaused):
+                    bg.load_wallets(path)
+            create.assert_not_called()
+            self.assertFalse(path.exists())
 
     def test_same_directory_cannot_be_locked_twice(self):
         with local_temp() as directory:
@@ -275,14 +328,62 @@ class MinerTests(unittest.TestCase):
 
     def test_unrecognized_status_prevents_mutation(self):
         self.api.positions = [{"id": "p", "status": "unexpected"}]
-        self.assertIsNone(self.miner.tick())
-        self.assertIn("paused_reason", self.miner.state)
+        self.assertGreaterEqual(self.miner.tick(), 300)
+        self.assertIn("last_error", self.miner.state)
         self.assertFalse(any(m == "POST" for m, _, _ in self.api.calls))
 
     def test_missing_referral_prevents_all_mutations(self):
         self.api.me["referredBy"] = None
-        self.assertIsNone(self.miner.tick())
+        self.assertGreaterEqual(self.miner.tick(), 300)
         self.assertEqual(len(self.api.calls), 1)
+
+    def test_unexpected_exception_is_retried_without_logging_secrets(self):
+        with patch.object(self.miner, "cycle", side_effect=[ValueError("SECRET-DO-NOT-LOG"), 15]), self.assertLogs(bg.LOG, level="WARNING") as logs:
+            self.assertGreaterEqual(self.miner.tick(), 15)
+            self.assertEqual(self.miner.tick(), 15)
+        self.assertNotIn("SECRET-DO-NOT-LOG", "\n".join(logs.output))
+        self.assertNotIn("last_error", self.miner.state)
+        self.assertEqual(self.miner.failures, 0)
+
+    def test_state_save_failure_does_not_escape_tick(self):
+        with patch.object(self.miner, "cycle", side_effect=RuntimeError()), patch.object(self.miner, "save", side_effect=OSError()):
+            self.assertGreaterEqual(self.miner.tick(), 15)
+
+    def test_failed_predeployment_save_never_sends_post_or_leaves_false_pending(self):
+        with patch.object(self.miner, "save", side_effect=[OSError(), None]):
+            self.assertGreaterEqual(self.miner.tick(), 15)
+        self.assertEqual(self.api.open_attempts, 0)
+        self.assertNotIn("pending_open", self.miner.state)
+        self.miner.tick()
+        self.assertEqual(self.api.open_attempts, 1)
+
+    def test_http_403_cools_down_instead_of_permanent_pause(self):
+        with patch.object(self.miner, "cycle", side_effect=[bg.ApiError(403), 15]):
+            self.assertGreaterEqual(self.miner.tick(), 300)
+            self.assertEqual(self.miner.tick(), 15)
+        self.assertNotIn("paused_reason", self.miner.state)
+
+    def test_old_paused_state_is_retried_automatically(self):
+        self.miner.state["paused_reason"] = "old version pause"
+        with patch.object(self.miner, "cycle", return_value=15) as cycle:
+            self.assertEqual(self.miner.tick(), 15)
+        cycle.assert_called_once_with()
+        self.assertNotIn("paused_reason", self.miner.state)
+
+    def test_corrupt_state_is_preserved_and_reloaded_after_repair(self):
+        self.miner.path.write_text("{broken", encoding="utf-8")
+        replacement = bg.Miner(wallet(), self.miner.path.parent.parent, Gate(), self.miner.args)
+        try:
+            self.assertFalse(replacement.state_loaded)
+            self.assertGreaterEqual(replacement.tick(), 15)
+            self.assertEqual(self.miner.path.read_text(encoding="utf-8"), "{broken")
+            bg.write_json(self.miner.path, {"token": "repaired"})
+            with patch.object(replacement, "cycle", return_value=15):
+                self.assertEqual(replacement.tick(), 15)
+            self.assertTrue(replacement.state_loaded)
+            self.assertEqual(replacement.api.state["token"], "repaired")
+        finally:
+            replacement.api.session.close()
 
     def test_uncertain_deployment_is_not_blindly_repeated(self):
         self.api.timeout_open = True
@@ -333,6 +434,42 @@ class MinerTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_stop_interrupts_a_long_global_rate_limit_wait(self):
+        stop = threading.Event()
+        request_stop = threading.Event()
+        entered = threading.Event()
+        gate = bg.RequestGate(0, request_stop)
+        gate.pause(3600)
+
+        def tick():
+            entered.set()
+            try:
+                gate.enter()
+            except bg.Stopped:
+                return None
+            raise AssertionError("Rate limit should not have expired")
+
+        miner = SimpleNamespace(tick=tick, api=SimpleNamespace(session=Mock()))
+        runner = threading.Thread(target=bg.run_miners, args=([miner], 1, stop, request_stop))
+        runner.start()
+        try:
+            self.assertTrue(entered.wait(2))
+        finally:
+            stop.set()
+            runner.join(3)
+        self.assertFalse(runner.is_alive())
+        self.assertTrue(request_stop.is_set())
+
+    def test_escaped_worker_exception_is_rescheduled_without_global_shutdown(self):
+        stop = threading.Event()
+        request_stop = threading.Event()
+        miner = SimpleNamespace(tick=Mock(side_effect=[RuntimeError("hidden"), None]), api=SimpleNamespace(session=Mock()))
+        with patch.object(bg.time, "monotonic", side_effect=itertools.count(0, 31)):
+            bg.run_miners([miner], 1, stop, request_stop)
+        self.assertEqual(miner.tick.call_count, 2)
+        self.assertFalse(stop.is_set())
+        self.assertTrue(request_stop.is_set())
+
     def test_wallets_are_not_ticked_concurrently(self):
         stop = threading.Event()
 
@@ -354,6 +491,79 @@ class SchedulerTests(unittest.TestCase):
         bg.run_miners(miners, 2, stop)
         self.assertEqual([m.count for m in miners], [3] * 5)
         self.assertTrue(all(m.api.session.close.called for m in miners))
+
+
+class RuntimeTests(unittest.TestCase):
+    def test_runtime_loads_exact_file_count_without_modifying_or_generating(self):
+        with local_temp() as directory:
+            root = Path(directory)
+            path = root / "wallet.json"
+            bg.write_json(path, {"version": 1, "wallets": [wallet(1), wallet(2)]})
+            before = path.read_bytes()
+            args = SimpleNamespace(data_dir=root / "data", clear_pending=None, init_only=False, wallet_file=path, request_interval=0.25, workers=3)
+            with patch.object(bg.Account, "create") as create, patch.object(bg, "ensure_wallets", side_effect=AssertionError("runtime must never enter generation")), patch.object(bg.requests, "Session") as session, patch.object(bg, "Miner", side_effect=lambda wallet, *args: SimpleNamespace(wallet=wallet)), patch.object(bg, "run_miners") as run:
+                self.assertEqual(bg.run_client(args, threading.Event()), 0)
+            self.assertEqual([miner.wallet for miner in run.call_args.args[0]], [wallet(1), wallet(2)])
+            create.assert_not_called()
+            session.assert_not_called()
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_runtime_missing_file_never_falls_back_to_generation(self):
+        with local_temp() as directory:
+            root = Path(directory)
+            path = root / "wallet.json"
+            bg.secure_directory(root / "data")
+            bg.write_json(root / "data" / "wallets.json", {"version": 1, "wallets": [wallet(1)]})
+            args = SimpleNamespace(data_dir=root / "data", clear_pending=None, init_only=False, wallet_file=path)
+            with patch.object(bg.Account, "create") as create, patch.object(bg.requests, "Session") as session:
+                with self.assertRaises(bg.WalletPaused):
+                    bg.run_client(args, threading.Event())
+            create.assert_not_called()
+            session.assert_not_called()
+            self.assertFalse(path.exists())
+
+    def test_closed_window_logging_is_discarded_without_a_file(self):
+        stream = Mock()
+        stream.write.side_effect = BrokenPipeError()
+        handler = bg.WindowLogHandler(stream)
+        record = logging.LogRecord("test", logging.INFO, "", 1, "hello", (), None)
+        handler.emit(record)
+        handler.emit(record)
+        self.assertTrue(handler.window_closed)
+        self.assertEqual(stream.write.call_count, 1)
+        self.assertNotIsInstance(handler, logging.FileHandler)
+
+    def test_main_retries_bootstrap_error_until_explicit_shutdown(self):
+        stop = threading.Event()
+        attempts = []
+
+        def run_client(args, event):
+            attempts.append(args)
+            if len(attempts) == 1:
+                raise RuntimeError("SECRET-DO-NOT-LOG")
+            event.set()
+            return 0
+
+        with patch.object(bg.threading, "Event", return_value=stop), patch.object(stop, "wait", return_value=False), patch.object(bg.signal, "signal"), patch.object(bg, "run_client", side_effect=run_client), self.assertLogs(bg.LOG, level="ERROR") as logs:
+            self.assertEqual(bg.main([]), 0)
+        self.assertEqual(len(attempts), 2)
+        self.assertNotIn("SECRET-DO-NOT-LOG", "\n".join(logs.output))
+
+    def test_retrying_corrupt_vault_never_regenerates_keys(self):
+        with local_temp() as directory:
+            path = Path(directory) / "wallet.json"
+            path.write_text("{broken", encoding="utf-8")
+            stop = threading.Event()
+
+            def stop_waiting(seconds):
+                stop.set()
+                return True
+
+            with patch.object(bg.threading, "Event", return_value=stop), patch.object(stop, "wait", side_effect=stop_waiting), patch.object(bg.signal, "signal"), patch.object(bg.Account, "create") as create, patch.object(bg.requests, "Session") as session:
+                self.assertEqual(bg.main(["--data-dir", directory, "--wallet-file", str(path)]), 0)
+            self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
+            create.assert_not_called()
+            session.assert_not_called()
 
 
 if __name__ == "__main__":

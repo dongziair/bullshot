@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux one-command bootstrap. Usage: bash start.sh [start|stop|status|logs]
+# Step 2: read wallet.json and run. Step 1 is generate_wallets.sh COUNT.
 set -Eeuo pipefail
 umask 077
 
@@ -21,8 +21,10 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 exec python3 - "$SCRIPT_DIR" "$@" <<'PYTHON'
+import argparse
 import contextlib
 import hashlib
+import json
 import os
 import platform
 import shutil
@@ -41,7 +43,7 @@ class Launcher:
         self.requirements = self.root / "requirements.txt"
         self.python = self.root / ".venv" / "bin" / "python"
         self.pid_file = self.root / "bull_gems.pid"
-        self.log_file = self.root / "bull_gems.log"
+        self.wallet_file = self.root / "wallet.json"
 
     def read_pid(self):
         try:
@@ -114,6 +116,13 @@ class Launcher:
             marker.write_text(fingerprint + "\n", encoding="ascii")
 
     def start(self, extra_args):
+        if any(arg.split("=", 1)[0] in {"--init-only", "--wallets"} for arg in extra_args):
+            raise RuntimeError("运行脚本不生成钱包；请先执行 bash generate_wallets.sh 数量。")
+        options = argparse.ArgumentParser(add_help=False)
+        options.add_argument("--wallet-file", type=Path, default=self.wallet_file)
+        selected, extra_args = options.parse_known_args(extra_args)
+        wallet_file = selected.wallet_file.expanduser()
+        wallet_file = (self.root / wallet_file).resolve()
         import fcntl
 
         # Hold a short-lived bootstrap lock, not the long-running miner's lock.
@@ -127,32 +136,63 @@ class Launcher:
             if pid is not None:
                 print(f"已经在运行，PID={pid}，不会重复启动。")
                 return 0
+            if not wallet_file.is_file():
+                raise RuntimeError("缺少 wallet.json；请先执行 bash generate_wallets.sh 100（数量可修改）。")
+            vault = json.loads(wallet_file.read_text(encoding="utf-8"))
+            if not isinstance(vault, dict) or vault.get("version") != 1 or not isinstance(vault.get("wallets"), list) or not vault["wallets"]:
+                raise RuntimeError("钱包文件格式错误或没有钱包；不会自动创建或覆盖。")
+            count = len(vault["wallets"])
             self.ensure_environment()
             command = [
                 str(self.python), "-u", str(self.script),
-                "--wallets", "100", "--ref-code", "0x75527f54", *extra_args,
+                "--wallet-file", str(wallet_file), "--ref-code", "0x75527f54", *extra_args,
             ]
-            # Detach without nohup/shell; closing SSH does not terminate this process.
-            with self.log_file.open("ab") as log:
-                self.log_file.chmod(0o600)
-                process = subprocess.Popen(
-                    command, cwd=str(self.root), stdin=subprocess.DEVNULL,
-                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-                    close_fds=True,
-                )
+            # Detach from the terminal's process group, but keep console output.
+            # The client discards output after SSH closes; no log file is opened.
+            process = subprocess.Popen(
+                command, cwd=str(self.root), stdin=subprocess.DEVNULL,
+                stdout=None, stderr=None, start_new_session=True,
+                close_fds=True,
+            )
             self.pid_file.write_text(str(process.pid) + "\n", encoding="ascii")
             self.pid_file.chmod(0o600)
             time.sleep(2)
             code = process.poll()
             if code is not None:
                 self.clear_pid(process.pid)
-                print(f"进程已经退出（退出码 {code}）。请执行：bash start.sh logs", file=sys.stderr)
+                print(f"进程已经退出（退出码 {code}），请查看当前窗口的错误信息。", file=sys.stderr)
                 return code or 1
-            print(f"已后台启动，PID={process.pid}；100 个钱包，邀请码 0x75527f54。")
-            print(f"钱包和私钥：{self.root / 'bull_gems_data' / 'wallets.json'}（仅本地保存）")
-            print(f"运行日志：{self.log_file}")
-            print("查看日志：bash start.sh logs")
+            print(f"已后台启动，PID={process.pid}；读取 {count} 个钱包，邀请码 0x75527f54。")
+            print(f"钱包文件：{wallet_file}（只读使用，不自动生成或补齐）")
+            print("日志只在当前启动窗口打印，不写日志文件；关闭窗口后不保留历史日志。")
             print("停止运行：bash start.sh stop")
+            return 0
+
+    def generate(self, args):
+        options = argparse.ArgumentParser(prog="bash generate_wallets.sh", description="只生成钱包到 wallet.json，不注册、不挖矿；数量是目标总数。")
+        options.add_argument("count", type=int, help="钱包目标总数，范围 1..10000")
+        options.add_argument("--wallet-file", type=Path, default=self.wallet_file)
+        selected = options.parse_args(args)
+        if not 1 <= selected.count <= 10000:
+            options.error("数量必须在 1..10000 之间")
+        wallet_file = (self.root / selected.wallet_file.expanduser()).resolve()
+        import fcntl
+
+        with (self.root / ".bull_gems_start.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("另一个启动器正在准备环境，请稍后重试。")
+                return 0
+            if self.running_pid() is not None:
+                raise RuntimeError("请先 bash start.sh stop，再调整钱包数量。")
+            self.ensure_environment()
+            subprocess.run([
+                str(self.python), str(self.script), "--init-only",
+                "--wallets", str(selected.count), "--wallet-file", str(wallet_file),
+            ], cwd=str(self.root), check=True)
+            print(f"钱包文件已准备好：{wallet_file}；目标总数 {selected.count}。")
+            print("现在执行 bash start.sh 读取钱包并循环运行。")
             return 0
 
     def stop(self):
@@ -183,8 +223,8 @@ def main(argv):
         return 1
     launcher = Launcher(argv[0])
     args = argv[1:]
-    action = args.pop(0) if args and args[0] in {"start", "stop", "status", "logs"} else "start"
-    if action != "start" and args:
+    action = args.pop(0) if args and args[0] in {"start", "stop", "status", "logs", "generate"} else "start"
+    if action not in {"start", "generate"} and args:
         print("用法：bash start.sh [start|stop|status|logs]；启动时可附加 --resume 等参数。", file=sys.stderr)
         return 1
     if action == "stop":
@@ -194,17 +234,18 @@ def main(argv):
         print(f"正在运行，PID={pid}" if pid is not None else "当前未运行。")
         return 0 if pid is not None else 1
     if action == "logs":
-        if not launcher.log_file.is_file():
-            print("还没有日志，请先执行 bash start.sh。", file=sys.stderr)
-            return 1
-        os.execvp("tail", ["tail", "-n", "50", "-f", str(launcher.log_file)])
+        print("日志仅在启动时的窗口打印，不写入文件；没有可追溯或重新附加的历史日志。")
+        return 0
+    if action == "generate":
+        return launcher.generate(args)
     return launcher.start(args)
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
-        print(f"启动失败：{error}", file=sys.stderr)
+    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
+        label = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+        print(f"启动失败：{label}", file=sys.stderr)
         raise SystemExit(1)
 PYTHON

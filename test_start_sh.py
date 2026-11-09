@@ -1,6 +1,7 @@
 """Offline tests for the Python launcher embedded in the Linux start.sh."""
 
 import hashlib
+import json
 import os
 import signal
 import subprocess
@@ -29,6 +30,7 @@ class LauncherTests(unittest.TestCase):
         self.launcher = Launcher(self.root, proc_root=self.root / "test-proc")
         self.launcher.script.write_text("# Mock miner; never executed.\n", encoding="utf-8")
         self.launcher.requirements.write_text("requests>=2.32,<3\n", encoding="ascii")
+        self.launcher.wallet_file.write_text(json.dumps({"version": 1, "wallets": [{"address": "TEST-1", "private_key": "TEST-ONLY"}, {"address": "TEST-2", "private_key": "TEST-ONLY"}]}), encoding="utf-8")
         self.fcntl = SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=Mock())
 
     def tearDown(self):
@@ -42,7 +44,7 @@ class LauncherTests(unittest.TestCase):
             marker = self.launcher.python.parent.parent / ".bull_gems_requirements.sha256"
             marker.write_text(fingerprint + "\n", encoding="ascii")
 
-    def test_launches_background_with_100_wallets_and_new_referral(self):
+    def test_launches_background_reading_wallet_json_without_generation_flags(self):
         process = Mock(pid=12345)
         process.poll.return_value = None
         with patch.dict("sys.modules", {"fcntl": self.fcntl}), patch.object(self.launcher, "running_pid", return_value=None), patch.object(self.launcher, "ensure_environment") as setup, patch.object(subprocess, "Popen", return_value=process) as popen, patch.object(NAMESPACE["time"], "sleep"):
@@ -50,12 +52,59 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result, 0)
         setup.assert_called_once_with()
         command = popen.call_args.args[0]
-        self.assertEqual(command, [str(self.launcher.python), "-u", str(self.launcher.script), "--wallets", "100", "--ref-code", "0x75527f54", "--resume"])
+        self.assertEqual(command, [str(self.launcher.python), "-u", str(self.launcher.script), "--wallet-file", str(self.launcher.wallet_file), "--ref-code", "0x75527f54", "--resume"])
+        self.assertNotIn("--wallets", command)
+        self.assertNotIn("--init-only", command)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         self.assertTrue(popen.call_args.kwargs["close_fds"])
         self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIsNone(popen.call_args.kwargs["stdout"])
+        self.assertIsNone(popen.call_args.kwargs["stderr"])
         self.assertEqual(popen.call_args.kwargs["cwd"], str(self.root))
         self.assertEqual(self.launcher.read_pid(), 12345)
+        self.assertEqual(list(self.root.glob("*.log")), [])
+
+    def test_generation_runs_once_with_selected_count_and_no_background_process(self):
+        with patch.dict("sys.modules", {"fcntl": self.fcntl}), patch.object(self.launcher, "running_pid", return_value=None), patch.object(self.launcher, "ensure_environment"), patch.object(subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run, patch.object(subprocess, "Popen") as popen:
+            self.assertEqual(self.launcher.generate(["37"]), 0)
+        self.assertEqual(run.call_args.args[0], [str(self.launcher.python), str(self.launcher.script), "--init-only", "--wallets", "37", "--wallet-file", str(self.launcher.wallet_file)])
+        popen.assert_not_called()
+        self.assertFalse(self.launcher.pid_file.exists())
+
+    def test_start_rejects_generation_flags(self):
+        with patch.object(subprocess, "Popen") as popen:
+            for args in (["--wallets", "50"], ["--wallets=50"], ["--init-only"]):
+                with self.assertRaises(RuntimeError):
+                    self.launcher.start(args)
+        popen.assert_not_called()
+
+    def test_start_without_wallet_file_does_not_generate_or_spawn(self):
+        self.launcher.wallet_file.unlink()
+        with patch.dict("sys.modules", {"fcntl": self.fcntl}), patch.object(self.launcher, "running_pid", return_value=None), patch.object(self.launcher, "ensure_environment") as setup, patch.object(subprocess, "Popen") as popen:
+            with self.assertRaises(RuntimeError):
+                self.launcher.start([])
+        setup.assert_not_called()
+        popen.assert_not_called()
+        self.assertFalse(self.launcher.wallet_file.exists())
+
+    def test_generation_refuses_to_change_wallet_count_while_running(self):
+        with patch.dict("sys.modules", {"fcntl": self.fcntl}), patch.object(self.launcher, "running_pid", return_value=12345), patch.object(subprocess, "run") as run:
+            with self.assertRaises(RuntimeError):
+                self.launcher.generate(["5"])
+        run.assert_not_called()
+
+    def test_generation_requires_positive_bounded_count(self):
+        with patch.object(subprocess, "run") as run:
+            for args in ([], ["0"], ["-1"], ["10001"]):
+                with self.assertRaises(SystemExit):
+                    self.launcher.generate(args)
+        run.assert_not_called()
+
+    def test_logs_command_does_not_open_or_replay_any_file(self):
+        with patch.object(NAMESPACE["platform"], "system", return_value="Linux"), patch.object(os, "execvp") as execute:
+            self.assertEqual(NAMESPACE["main"]([str(self.root), "logs"]), 0)
+        execute.assert_not_called()
+        self.assertEqual(list(self.root.glob("*.log")), [])
 
     def test_already_running_does_not_install_or_spawn(self):
         with patch.dict("sys.modules", {"fcntl": self.fcntl}), patch.object(self.launcher, "running_pid", return_value=12345), patch.object(self.launcher, "ensure_environment") as setup, patch.object(subprocess, "Popen") as popen:
@@ -137,6 +186,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_shell_file_uses_unix_line_endings(self):
         self.assertNotIn(b"\r", SCRIPT.read_bytes())
+        self.assertNotIn(b"\r", (SCRIPT.parent / "generate_wallets.sh").read_bytes())
 
 
 if __name__ == "__main__":

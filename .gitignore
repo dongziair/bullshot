@@ -5,3 +5,5 @@ bull_gems_data/
 .test-bull-gems-*/
 bull_gems.pid
 .bull_gems_start.lock
+wallet.json
+.wallet.json.*

@@ -13,6 +13,7 @@ import os
 import random
 import re
 import signal
+import sys
 import tempfile
 import threading
 import time
@@ -36,6 +37,27 @@ ENERGY_COST = 5
 DURATION_SECONDS = 60
 MAX_POSITIONS = 5
 LOG = logging.getLogger("bull_gems")
+
+
+class WindowLogHandler(logging.StreamHandler):
+    """Console only; a closed SSH terminal must not break the mining loop."""
+
+    def __init__(self, stream=None):
+        super().__init__(sys.stdout if stream is None else stream)
+        self.window_closed = False
+
+    def emit(self, record):
+        if self.window_closed:
+            return
+        try:
+            self.stream.write(self.format(record) + self.terminator)
+            self.flush()
+        except (OSError, ValueError):
+            # No fallback file and no traceback: discard subsequent console output.
+            self.window_closed = True
+        except Exception:
+            # A formatting/console failure is not a reason to stop workers.
+            pass
 
 
 class ShapeError(Exception):
@@ -119,17 +141,16 @@ def directory_lock(folder: Path):
         stream.close()
 
 
-def ensure_wallets(folder: Path, count: int) -> list[dict]:
-    path = folder / "wallets.json"
-    if path.exists():
-        vault = read_json(path)
-        if vault.get("version") != 1 or not isinstance(vault.get("wallets"), list):
-            raise ShapeError("Invalid wallet vault; refusing to replace it")
-        wallets = vault["wallets"]
-    else:
-        if any((folder / "state").glob("*.json")):
-            raise WalletPaused("State exists but wallets.json is missing; restore your vault")
-        wallets = []
+def load_wallets(path: Path) -> list[dict]:
+    """Read and validate a vault without changing it or generating any key."""
+    if not path.is_file():
+        raise WalletPaused("Wallet file missing; run bash generate_wallets.sh COUNT first")
+    vault = read_json(path)
+    if vault.get("version") != 1 or not isinstance(vault.get("wallets"), list):
+        raise ShapeError("Invalid wallet vault; refusing to replace it")
+    wallets = vault["wallets"]
+    if not wallets:
+        raise ShapeError("Wallet file is empty; generate wallets first")
     seen = set()
     for wallet in wallets:
         if not isinstance(wallet, dict):
@@ -142,8 +163,25 @@ def ensure_wallets(folder: Path, count: int) -> list[dict]:
         if not valid or address.lower() in seen:
             raise ShapeError("Wallet address mismatch or duplicate")
         seen.add(address.lower())
+    return wallets
+
+
+def ensure_wallets(folder: Path, count: int, wallet_file: Path | None = None) -> list[dict]:
+    """Generation-only entry: append to the requested total, never replace keys."""
+    path = wallet_file if wallet_file is not None else folder / "wallets.json"
+    legacy = folder / "wallets.json"
+    if path.exists():
+        wallets = load_wallets(path)
+    elif path != legacy and legacy.exists():
+        # Reuse old deployments' keys when explicitly running the generation step.
+        wallets = load_wallets(legacy)
+    else:
+        if any((folder / "state").glob("*.json")):
+            raise WalletPaused("State exists but the wallet file is missing; restore your vault")
+        wallets = []
     if len(wallets) > count:
         raise WalletPaused("Vault has more wallets than --wallets; refusing to ignore any")
+    seen = {wallet["address"].lower() for wallet in wallets}
     changed = not path.exists()
     while len(wallets) < count:
         account = Account.create()
@@ -157,7 +195,7 @@ def ensure_wallets(folder: Path, count: int) -> list[dict]:
         seen.add(account.address.lower())
         changed = True
     if changed:
-        # No network activity is allowed until every key has been persisted.
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         write_json(path, {"version": 1, "wallets": wallets})
     if os.name == "posix":
         path.chmod(0o600)
@@ -352,7 +390,13 @@ class Miner:
     def __init__(self, wallet: dict, folder: Path, gate: RequestGate, args):
         self.wallet = wallet
         self.path = folder / "state" / (wallet["address"].lower() + ".json")
-        self.state = read_json(self.path) if self.path.exists() else {}
+        self.state = {}
+        self.state_loaded = False
+        try:
+            self.load_state()
+        except Exception:
+            # A bad state file affects only this wallet; tick() retries loading it.
+            pass
         self.api = Api(wallet, self.state, self.save, gate, args.ref_code)
         self.args = args
         self.failures = 0
@@ -360,6 +404,12 @@ class Miner:
         self.locations_at = 0.0
         self.warned_no_location = False
         self.warned_pending = False
+
+    def load_state(self) -> None:
+        data = read_json(self.path) if self.path.exists() else {}
+        self.state.clear()
+        self.state.update(data)
+        self.state_loaded = True
 
     def save(self) -> None:
         write_json(self.path, self.state)
@@ -475,7 +525,12 @@ class Miner:
                     "before_ids": [item_id(p) for p in positions],
                     "created_at": utc_now(), "location_id": item_id(location),
                 }
-                self.save()
+                try:
+                    self.save()
+                except Exception:
+                    # No POST was sent: do not leave a false uncertain-deployment marker.
+                    self.state.pop("pending_open", None)
+                    raise
                 try:
                     self.api.request("POST", "/mining/positions", {"locationId": location.get("id", location.get("_id"))})
                 except ApiError as error:
@@ -501,41 +556,44 @@ class Miner:
         return max(0.5, delay)
 
     def tick(self) -> float | None:
-        if self.state.get("paused_reason"):
-            LOG.warning("%s paused: %s", self.wallet["address"], self.state["paused_reason"])
-            return None
         try:
+            if not self.state_loaded:
+                self.load_state()
+            # Old versions permanently paused wallets. Recheck them automatically.
+            self.state.pop("paused_reason", None)
+            self.state.pop("last_error", None)
+            self.state.pop("retry_at", None)
             delay = self.cycle()
             self.failures = 0
             return delay
         except Stopped:
             return None
-        except (WalletPaused, ShapeError) as error:
-            self.state["paused_reason"] = str(error)
-            self.save()
-            LOG.error("%s paused: %s", self.wallet["address"], error)
-            return None
-        except (requests.RequestException, ApiError) as error:
-            if isinstance(error, ApiError) and (error.status == 403 or 300 <= error.status < 400):
-                self.state["paused_reason"] = f"HTTP {error.status}; access rejected or redirected"
-                self.save()
-                LOG.error("%s paused: %s", self.wallet["address"], self.state["paused_reason"])
-                return None
+        except Exception as error:
             self.failures += 1
             delay = min(300, 15 * 2 ** min(self.failures - 1, 5)) + random.uniform(0, 3)
             if isinstance(error, ApiError):
                 delay = max(delay, error.retry_after)
+                if error.status == 403 or 300 <= error.status < 400:
+                    delay = max(delay, 300)
                 label = f"HTTP {error.status}"
+            elif isinstance(error, (WalletPaused, ShapeError)):
+                delay = max(delay, 300)
+                label = str(error)
             else:
                 label = type(error).__name__
-            # Do not log a requests exception's text: it can contain request details.
-            self.state["last_error"] = label
-            self.save()
+            # Never overwrite an unreadable state: it may hold an uncertain POST.
+            if self.state_loaded:
+                self.state["last_error"] = label
+                self.state["retry_at"] = time.time() + delay
+                try:
+                    self.save()
+                except Exception as save_error:
+                    LOG.warning("%s state save failed: %s; keeping state in memory", self.wallet["address"], type(save_error).__name__)
             LOG.warning("%s %s; retry in %.1fs", self.wallet["address"], label, delay)
             return delay
 
 
-def run_miners(miners: list[Miner], workers: int, stop: threading.Event) -> None:
+def run_miners(miners: list[Miner], workers: int, stop: threading.Event, request_stop=None) -> None:
     queue = [(time.monotonic(), index) for index in range(len(miners))]
     heapq.heapify(queue)
     running = {}
@@ -552,19 +610,61 @@ def run_miners(miners: list[Miner], workers: int, stop: threading.Event) -> None
             done, _ = wait(running, timeout=0.5, return_when=FIRST_COMPLETED)
             for future in done:
                 index = running.pop(future)
-                delay = future.result()
+                try:
+                    delay = future.result()
+                except Exception as error:
+                    # Last-resort isolation if an unexpected failure escapes tick().
+                    LOG.warning("Worker %d failed: %s; retry in 30s", index, type(error).__name__)
+                    delay = 30
                 if delay is not None:
                     heapq.heappush(queue, (time.monotonic() + delay, index))
     finally:
-        stop.set()
+        # A scheduler failure must not set the user's permanent shutdown event.
+        if request_stop is not None:
+            request_stop.set()
         pool.shutdown(wait=True, cancel_futures=True)
         for miner in miners:
-            miner.api.session.close()
+            try:
+                miner.api.session.close()
+            except Exception:
+                pass
+
+
+def run_client(args, stop: threading.Event) -> int:
+    folder = args.data_dir.expanduser().resolve()
+    secure_directory(folder)
+    with directory_lock(folder):
+        secure_directory(folder / "state")
+        # Maintenance must not accidentally create a new vault or extra wallets.
+        if args.clear_pending:
+            if not re.fullmatch(r"0x[0-9a-fA-F]{40}", args.clear_pending):
+                raise WalletPaused("Invalid wallet address")
+            path = folder / "state" / (args.clear_pending.lower() + ".json")
+            if not path.is_file():
+                raise WalletPaused("No matching wallet state")
+            state = read_json(path)
+            state.pop("pending_open", None)
+            write_json(path, state)
+            LOG.info("Pending deployment marker cleared for %s", args.clear_pending)
+            return 0
+        if args.init_only:
+            wallets = ensure_wallets(folder, args.wallets or 100, args.wallet_file)
+            LOG.info("%d wallets saved to %s; no registration or mining requests sent", len(wallets), args.wallet_file)
+            return 0
+        # Runtime is strictly read-only with respect to the wallet vault.
+        wallets = load_wallets(args.wallet_file)
+        LOG.info("Loaded %d wallets from %s; no wallets will be generated", len(wallets), args.wallet_file)
+        request_stop = threading.Event()
+        gate = RequestGate(args.request_interval, request_stop)
+        miners = [Miner(wallet, folder, gate, args) for wallet in wallets]
+        run_miners(miners, args.workers, stop, request_stop)
+    return 0
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wallets", type=int, default=100, help="Total persistent wallet count; only append, never replace")
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--wallets", type=int, help="Generation only (--init-only): total count, default 100; never replace keys")
+    parser.add_argument("--wallet-file", type=Path, default=Path(__file__).resolve().parent / "wallet.json", help="Existing wallet vault to read; created/appended only with --init-only")
     parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent / "bull_gems_data")
     parser.add_argument("--ref-code", default=REF_CODE)
     parser.add_argument("--workers", type=int, default=3)
@@ -573,54 +673,37 @@ def main(argv=None) -> int:
     parser.add_argument("--location-id", help="Optional location ID; still requires 5 energy / 60 seconds")
     parser.add_argument("--skip-quests", action="store_true")
     parser.add_argument("--init-only", action="store_true", help="Create local wallet file without any network requests")
-    parser.add_argument("--resume", action="store_true", help="Clear persisted pause reasons after correcting their cause")
+    parser.add_argument("--resume", action="store_true", help="Compatibility option; failed wallets now retry automatically")
     parser.add_argument("--clear-pending", metavar="ADDRESS", help="After manual server-side verification, clear one uncertain deployment and exit")
     args = parser.parse_args(argv)
-    if not 1 <= args.wallets <= 10000 or not 1 <= args.workers <= 20:
+    if (args.wallets is not None and not 1 <= args.wallets <= 10000) or not 1 <= args.workers <= 20:
         parser.error("--wallets must be 1..10000; --workers must be 1..20")
+    if args.wallets is not None and not args.init_only:
+        parser.error("--wallets is only for generation with --init-only; runtime reads all wallets in --wallet-file")
     if not math.isfinite(args.interval) or args.interval < 15 or not math.isfinite(args.request_interval) or args.request_interval < 0.1:
         parser.error("--interval must be >=15; --request-interval must be >=0.1")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[WindowLogHandler()])
     stop = threading.Event()
     for name in ("SIGINT", "SIGTERM"):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), lambda *_: stop.set())
-    try:
-        folder = args.data_dir.expanduser().resolve()
-        secure_directory(folder)
-        with directory_lock(folder):
-            secure_directory(folder / "state")
-            # Maintenance must not accidentally create a new vault or extra wallets.
-            if args.clear_pending:
-                if not re.fullmatch(r"0x[0-9a-fA-F]{40}", args.clear_pending):
-                    raise WalletPaused("Invalid wallet address")
-                path = folder / "state" / (args.clear_pending.lower() + ".json")
-                if not path.is_file():
-                    raise WalletPaused("No matching wallet state")
-                state = read_json(path)
-                state.pop("pending_open", None)
-                write_json(path, state)
-                LOG.info("Pending deployment marker cleared for %s", args.clear_pending)
-                return 0
-            wallets = ensure_wallets(folder, args.wallets)
-            LOG.info("%d wallets persisted at %s; keys will not be printed", len(wallets), folder / "wallets.json")
-            if args.init_only:
-                return 0
-            gate = RequestGate(args.request_interval, stop)
-            miners = [Miner(wallet, folder, gate, args) for wallet in wallets]
-            if args.resume:
-                for miner in miners:
-                    miner.state.pop("paused_reason", None)
-                    miner.save()
-            run_miners(miners, args.workers, stop)
-            if any(miner.state.get("paused_reason") for miner in miners):
-                LOG.warning("Some wallets are paused; see state files and README.md")
-                return 2
-    except (OSError, ValueError, ShapeError, WalletPaused, KeyError, TypeError, AttributeError) as error:
-        # Exception values originating in external libraries can contain key material.
-        label = str(error) if isinstance(error, (ShapeError, WalletPaused)) else type(error).__name__
-        LOG.error("Stopped: %s", label)
-        return 1
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    args.wallet_file = args.wallet_file.expanduser().resolve()
+    maintenance = bool(args.init_only or args.clear_pending)
+    while not stop.is_set():
+        try:
+            result = run_client(args, stop)
+            if maintenance or stop.is_set():
+                return result
+            LOG.warning("Worker loop ended; restarting in 30s")
+        except Exception as error:
+            # Preserve the vault, and retry bootstrap/scheduler failures as well.
+            label = str(error) if isinstance(error, (ShapeError, WalletPaused)) else type(error).__name__
+            LOG.error("Client error: %s%s", label, "; retry in 30s" if not maintenance else "")
+            if maintenance:
+                return 1
+        stop.wait(30)
     return 0
 
 
