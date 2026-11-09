@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Step 2: read wallet.json and run. Step 1 is generate_wallets.sh COUNT.
+# Step 2: read wallet.json and run in this terminal; Ctrl+C stops it.
+# Step 1 is generate_wallets.sh COUNT.
 set -Eeuo pipefail
 umask 077
 
@@ -130,11 +131,11 @@ class Launcher:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                print("另一个启动器正在准备环境，请稍后查看状态。")
+                print("另一个启动器正在准备环境，请稍后重试。")
                 return 0
             pid = self.running_pid()
             if pid is not None:
-                print(f"已经在运行，PID={pid}，不会重复启动。")
+                print(f"检测到旧版后台进程，PID={pid}，不会重复启动。请先停止旧进程。")
                 return 0
             if not wallet_file.is_file():
                 raise RuntimeError("缺少 wallet.json；请先执行 bash generate_wallets.sh 100（数量可修改）。")
@@ -147,26 +148,14 @@ class Launcher:
                 str(self.python), "-u", str(self.script),
                 "--wallet-file", str(wallet_file), "--ref-code", "0x75527f54", *extra_args,
             ]
-            # Detach from the terminal's process group, but keep console output.
-            # The client discards output after SSH closes; no log file is opened.
-            process = subprocess.Popen(
-                command, cwd=str(self.root), stdin=subprocess.DEVNULL,
-                stdout=None, stderr=None, start_new_session=True,
-                close_fds=True,
-            )
-            self.pid_file.write_text(str(process.pid) + "\n", encoding="ascii")
-            self.pid_file.chmod(0o600)
-            time.sleep(2)
-            code = process.poll()
-            if code is not None:
-                self.clear_pid(process.pid)
-                print(f"进程已经退出（退出码 {code}），请查看当前窗口的错误信息。", file=sys.stderr)
-                return code or 1
-            print(f"已后台启动，PID={process.pid}；读取 {count} 个钱包，邀请码 0x75527f54。")
-            print(f"钱包文件：{wallet_file}（只读使用，不自动生成或补齐）")
-            print("日志只在当前启动窗口打印，不写日志文件；关闭窗口后不保留历史日志。")
-            print("停止运行：bash start.sh stop")
-            return 0
+            print(f"在当前窗口运行；读取 {count} 个钱包，邀请码 0x75527f54。", flush=True)
+            print(f"钱包文件：{wallet_file}（只读使用，不自动生成或补齐）", flush=True)
+            print("日志仅输出当前窗口，不写日志文件；按 Ctrl+C 停止。", flush=True)
+            # Replace the launcher, keeping its terminal and foreground process
+            # group. Ctrl+C goes directly to the client; no detached child remains.
+            # The bootstrap lock fd is non-inheritable and closes during exec.
+            os.chdir(self.root)
+            os.execv(str(self.python), command)
 
     def generate(self, args):
         options = argparse.ArgumentParser(prog="bash generate_wallets.sh", description="只生成钱包到 wallet.json，不注册、不挖矿；数量是目标总数。")
@@ -185,7 +174,7 @@ class Launcher:
                 print("另一个启动器正在准备环境，请稍后重试。")
                 return 0
             if self.running_pid() is not None:
-                raise RuntimeError("请先 bash start.sh stop，再调整钱包数量。")
+                raise RuntimeError("检测到旧版后台进程，请先停止旧进程，再调整钱包数量。")
             self.ensure_environment()
             subprocess.run([
                 str(self.python), str(self.script), "--init-only",
@@ -244,6 +233,9 @@ def main(argv):
 if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print("\n已取消启动。", file=sys.stderr)
+        raise SystemExit(130)
     except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
         label = str(error) if isinstance(error, RuntimeError) else type(error).__name__
         print(f"启动失败：{label}", file=sys.stderr)

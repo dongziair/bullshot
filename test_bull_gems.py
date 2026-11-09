@@ -494,6 +494,29 @@ class SchedulerTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_terminal_signals_stop_runtime_without_retry_or_generation(self):
+        for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+            if not hasattr(bg.signal, name):
+                continue
+            with self.subTest(signal=name):
+                handlers = {}
+                stop = threading.Event()
+
+                def register(signum, handler):
+                    handlers[signum] = handler
+
+                def receive_signal(args, event):
+                    self.assertFalse(event.is_set())
+                    handlers[getattr(bg.signal, name)](getattr(bg.signal, name), None)
+                    self.assertTrue(event.is_set())
+                    return 0
+
+                with patch.object(bg.threading, "Event", return_value=stop), patch.object(bg.signal, "signal", side_effect=register), patch.object(bg, "run_client", side_effect=receive_signal) as run, patch.object(stop, "wait") as wait, patch.object(bg.Account, "create") as create:
+                    self.assertEqual(bg.main([]), 0)
+                run.assert_called_once()
+                wait.assert_not_called()
+                create.assert_not_called()
+
     def test_runtime_loads_exact_file_count_without_modifying_or_generating(self):
         with local_temp() as directory:
             root = Path(directory)

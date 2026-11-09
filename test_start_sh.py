@@ -44,24 +44,20 @@ class LauncherTests(unittest.TestCase):
             marker = self.launcher.python.parent.parent / ".bull_gems_requirements.sha256"
             marker.write_text(fingerprint + "\n", encoding="ascii")
 
-    def test_launches_background_reading_wallet_json_without_generation_flags(self):
-        process = Mock(pid=12345)
-        process.poll.return_value = None
-        with patch.dict("sys.modules", {"fcntl": self.fcntl}), patch.object(self.launcher, "running_pid", return_value=None), patch.object(self.launcher, "ensure_environment") as setup, patch.object(subprocess, "Popen", return_value=process) as popen, patch.object(NAMESPACE["time"], "sleep"):
-            result = self.launcher.start(["--resume"])
-        self.assertEqual(result, 0)
+    def test_launches_in_current_terminal_by_exec_without_detaching(self):
+        with patch.dict("sys.modules", {"fcntl": self.fcntl}), patch.object(self.launcher, "running_pid", return_value=None), patch.object(self.launcher, "ensure_environment") as setup, patch.object(os, "chdir") as chdir, patch.object(os, "execv", side_effect=SystemExit(0)) as execute, patch.object(subprocess, "Popen") as popen:
+            with self.assertRaises(SystemExit) as exit_result:
+                self.launcher.start(["--resume"])
+        self.assertEqual(exit_result.exception.code, 0)
         setup.assert_called_once_with()
-        command = popen.call_args.args[0]
+        command = execute.call_args.args[1]
+        self.assertEqual(execute.call_args.args[0], str(self.launcher.python))
         self.assertEqual(command, [str(self.launcher.python), "-u", str(self.launcher.script), "--wallet-file", str(self.launcher.wallet_file), "--ref-code", "0x75527f54", "--resume"])
         self.assertNotIn("--wallets", command)
         self.assertNotIn("--init-only", command)
-        self.assertTrue(popen.call_args.kwargs["start_new_session"])
-        self.assertTrue(popen.call_args.kwargs["close_fds"])
-        self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
-        self.assertIsNone(popen.call_args.kwargs["stdout"])
-        self.assertIsNone(popen.call_args.kwargs["stderr"])
-        self.assertEqual(popen.call_args.kwargs["cwd"], str(self.root))
-        self.assertEqual(self.launcher.read_pid(), 12345)
+        chdir.assert_called_once_with(self.root)
+        popen.assert_not_called()
+        self.assertFalse(self.launcher.pid_file.exists())
         self.assertEqual(list(self.root.glob("*.log")), [])
 
     def test_generation_runs_once_with_selected_count_and_no_background_process(self):
@@ -149,12 +145,80 @@ class LauncherTests(unittest.TestCase):
         self.assertIn(["apt-get", "install", "-y", "python3-venv"], commands)
         self.assertEqual(commands[0], commands[-1])
 
-    def test_startup_failure_is_not_reported_as_running(self):
-        process = Mock(pid=12345)
-        process.poll.return_value = 2
-        with patch.dict("sys.modules", {"fcntl": self.fcntl}), patch.object(self.launcher, "running_pid", return_value=None), patch.object(self.launcher, "ensure_environment"), patch.object(subprocess, "Popen", return_value=process), patch.object(NAMESPACE["time"], "sleep"):
-            self.assertEqual(self.launcher.start([]), 2)
+    def test_exec_failure_does_not_leave_background_process_or_pid(self):
+        with patch.dict("sys.modules", {"fcntl": self.fcntl}), patch.object(self.launcher, "running_pid", return_value=None), patch.object(self.launcher, "ensure_environment"), patch.object(os, "chdir"), patch.object(os, "execv", side_effect=OSError("Test exec failure")), patch.object(subprocess, "Popen") as popen:
+            with self.assertRaises(OSError):
+                self.launcher.start([])
+        popen.assert_not_called()
         self.assertFalse(self.launcher.pid_file.exists())
+
+    def test_ctrl_c_during_bootstrap_exits_without_a_traceback(self):
+        main = Mock(side_effect=KeyboardInterrupt())
+        namespace = dict(NAMESPACE, __name__="__main__", main=main)
+        entrypoint = PYTHON_SOURCE[PYTHON_SOURCE.index('if __name__ == "__main__":'):]
+        with self.assertRaises(SystemExit) as exit_result:
+            exec(compile(entrypoint, str(SCRIPT), "exec"), namespace)
+        self.assertEqual(exit_result.exception.code, 130)
+
+    @unittest.skipUnless(os.name == "posix", "Actual exec/process-group signal test requires POSIX")
+    def test_foreground_exec_keeps_pid_and_exits_on_terminal_sigint(self):
+        # A local stub replaces the miner: no keys, HTTP or dependencies used.
+        self.launcher.python.parent.mkdir(parents=True)
+        self.launcher.python.symlink_to(NAMESPACE["sys"].executable)
+        self.launcher.script.write_text(
+            "import os, signal, threading\n"
+            "stop = threading.Event()\n"
+            "signal.signal(signal.SIGINT, lambda *_: stop.set())\n"
+            "print(f'FOREGROUND_READY:{os.getpid()}:{os.getpgrp()}', flush=True)\n"
+            "stop.wait(15)\n"
+            "raise SystemExit(0 if stop.is_set() else 1)\n",
+            encoding="utf-8",
+        )
+        wrapper = (
+            f"namespace = {{'__name__': 'launcher_integration_test'}}\n"
+            f"exec(compile({PYTHON_SOURCE!r}, 'start.sh', 'exec'), namespace)\n"
+            "Launcher = namespace['Launcher']\n"
+            "Launcher.ensure_environment = lambda self: None\n"
+            "Launcher(namespace['sys'].argv[1]).start([])\n"
+        )
+        process = subprocess.Popen(
+            [NAMESPACE["sys"].executable, "-u", "-c", wrapper, str(self.root)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", start_new_session=True,
+        )
+        try:
+            import selectors
+
+            # Read the underlying descriptor so buffered read-ahead cannot mask
+            # readiness. A deadline prevents a failed launcher from hanging CI.
+            deadline = NAMESPACE["time"].monotonic() + 10
+            output = b""
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while b"FOREGROUND_READY:" not in output:
+                    remaining = deadline - NAMESPACE["time"].monotonic()
+                    self.assertGreater(remaining, 0, output.decode("utf-8", errors="replace"))
+                    self.assertTrue(selector.select(remaining), "Timed out waiting for stub")
+                    chunk = os.read(process.stdout.fileno(), 4096)
+                    self.assertTrue(chunk, output.decode("utf-8", errors="replace"))
+                    output += chunk
+                while not output.split(b"FOREGROUND_READY:", 1)[1].endswith(b"\n"):
+                    remaining = deadline - NAMESPACE["time"].monotonic()
+                    self.assertGreater(remaining, 0)
+                    self.assertTrue(selector.select(remaining))
+                    chunk = os.read(process.stdout.fileno(), 4096)
+                    self.assertTrue(chunk)
+                    output += chunk
+            self.assertIn(f"FOREGROUND_READY:{process.pid}:{process.pid}\n".encode(), output)
+            os.killpg(process.pid, signal.SIGINT)
+            self.assertEqual(process.wait(timeout=5), 0)
+            self.assertFalse(self.launcher.pid_file.exists())
+            self.assertEqual(list(self.root.glob("*.log")), [])
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+            process.stdout.close()
 
     def test_stale_pid_does_not_signal_unrelated_process(self):
         self.launcher.pid_file.write_text("12345\n", encoding="ascii")

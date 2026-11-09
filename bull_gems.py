@@ -40,7 +40,7 @@ LOG = logging.getLogger("bull_gems")
 
 
 class WindowLogHandler(logging.StreamHandler):
-    """Console only; a closed SSH terminal must not break the mining loop."""
+    """Console only; output failures must not break retry or shutdown handling."""
 
     def __init__(self, stream=None):
         super().__init__(sys.stdout if stream is None else stream)
@@ -684,11 +684,15 @@ def main(argv=None) -> int:
         parser.error("--interval must be >=15; --request-interval must be >=0.1")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[WindowLogHandler()])
     stop = threading.Event()
-    for name in ("SIGINT", "SIGTERM"):
+
+    def request_shutdown(*_):
+        if not stop.is_set():
+            stop.set()
+            LOG.info("Stop requested; waiting for active requests to finish")
+
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
         if hasattr(signal, name):
-            signal.signal(getattr(signal, name), lambda *_: stop.set())
-    if hasattr(signal, "SIGHUP"):
-        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            signal.signal(getattr(signal, name), request_shutdown)
     args.wallet_file = args.wallet_file.expanduser().resolve()
     maintenance = bool(args.init_only or args.clear_pending)
     while not stop.is_set():
