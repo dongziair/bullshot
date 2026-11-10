@@ -19,6 +19,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -38,6 +39,14 @@ STATUS_LOG_INTERVAL = 300
 LOCATION_CACHE_SECONDS = 300
 UPGRADE_CHECK_SECONDS = 60
 UPGRADE_RETRY_SECONDS = 300
+SWAP_CHECK_SECONDS = 60
+SWAP_RETRY_SECONDS = 300
+SWAP_RESOURCE_IDS = frozenset({
+    "iron-ore", "coal", "copper-ore", "sulfur", "cryo-shard", "void-dust",
+    "steel-ingot", "bronze-wire", "thermal-core", "void-reactor",
+})
+SWAP_GEM_IDS = frozenset({"emerald", "sapphire", "ruby", "diamond", "obsidian", "void-gem"})
+MAX_API_INTEGER = 2 ** 53 - 1
 LOG = logging.getLogger("bull_gems")
 
 
@@ -236,6 +245,18 @@ def number(value, field: str) -> float:
     except (TypeError, ValueError, OverflowError):
         raise ShapeError(f"Missing or invalid {field}") from None
     if not math.isfinite(result) or result < 0:
+        raise ShapeError(f"Invalid {field}")
+    return result
+
+
+def decimal_number(value, field: str) -> Decimal:
+    """Keep inventory fractions and quotes exact; reject the usual bad numbers."""
+    number(value, field)
+    try:
+        result = Decimal(str(value))
+    except InvalidOperation:
+        raise ShapeError(f"Missing or invalid {field}") from None
+    if not result.is_finite() or result < 0:
         raise ShapeError(f"Invalid {field}")
     return result
 
@@ -446,6 +467,8 @@ class Miner:
         self.warned_pending = False
         self.warned_pending_upgrade = False
         self.upgrade_notice = None
+        self.warned_pending_swap = False
+        self.swap_notice = None
         self.next_status_log = 0.0
 
     def load_state(self) -> None:
@@ -574,7 +597,7 @@ class Miner:
         Never buy speed/capacity, guess prices, or replay an uncertain purchase.
         Errors in this optional action must not prevent claims or deployments.
         """
-        if getattr(self.args, "skip_upgrades", False):
+        if not getattr(self.args, "auto_upgrades", False) or getattr(self.args, "skip_upgrades", False):
             return False
         try:
             if self.state.get("pending_upgrade"):
@@ -654,9 +677,172 @@ class Miner:
             self.defer_upgrade(error)
             return False
 
+    def get_swap_inventory(self) -> dict[str, Decimal]:
+        records = as_records(self.api.request("GET", "/user/inventory"), "inventory")
+        quantities = {}
+        for record in records:
+            asset_id = record.get("assetId") or record.get("asset_id")
+            if not isinstance(asset_id, str) or asset_id not in SWAP_RESOURCE_IDS | SWAP_GEM_IDS:
+                continue
+            if asset_id in quantities:
+                raise ShapeError("Duplicate inventory asset id")
+            quantities[asset_id] = decimal_number(record.get("quantity"), "inventory quantity")
+        return quantities
+
+    def defer_swap(self, error: Exception, *, readback_soon: bool = False) -> None:
+        delay = SWAP_RETRY_SECONDS
+        if isinstance(error, ApiError):
+            delay = max(delay, error.retry_after)
+            label = f"HTTP {error.status}"
+        elif isinstance(error, ShapeError):
+            label = str(error)
+        else:
+            label = type(error).__name__
+            if isinstance(error, requests.RequestException):
+                operation = getattr(error, "bull_gems_operation", None)
+                elapsed = getattr(error, "bull_gems_elapsed", None)
+                if isinstance(operation, str) and isinstance(elapsed, (int, float)):
+                    label += f" {operation} (elapsed={elapsed:.1f}s)"
+        self.state["swap_retry_at"] = time.time() + delay
+        # A lost POST response needs an early read before newly claimed rewards
+        # can hide the stock reduction. Failed readbacks themselves cool down.
+        self.state["swap_check_at"] = 0 if readback_soon else self.state["swap_retry_at"]
+        try:
+            self.save()
+        except Exception:
+            pass
+        LOG.warning("%s resource swap deferred: %s; retry in %gs; mining continues", self.wallet["address"], label, delay)
+
+    def reconcile_swap(self, quantities: dict[str, Decimal]) -> bool:
+        pending = self.state.get("pending_swap")
+        if not pending:
+            return False
+        if not isinstance(pending, dict) or pending.get("asset_id") not in SWAP_RESOURCE_IDS | SWAP_GEM_IDS:
+            raise ShapeError("Invalid pending resource swap")
+        asset_id = pending["asset_id"]
+        before = decimal_number(pending.get("quantity_before"), "pending swap quantity")
+        amount = decimal_number(pending.get("amount"), "pending swap amount")
+        if amount <= 0 or amount != int(amount) or amount > before or amount > MAX_API_INTEGER:
+            raise ShapeError("Invalid pending swap amount")
+        remaining = decimal_number(quantities.get(asset_id, 0), "inventory quantity")
+        if remaining > before - amount:
+            self.state["swap_check_at"] = time.time() + 15
+            self.save()
+            if not self.warned_pending_swap:
+                LOG.warning("%s resource swap awaiting inventory readback; new swaps paused, mining continues. See --clear-pending-swap", self.wallet["address"])
+                self.warned_pending_swap = True
+            return False
+        # A GEMS increase alone is not evidence: mining and quests also add GEMS.
+        self.state.pop("pending_swap", None)
+        self.state["swap_check_at"] = 0
+        self.state["swap_retry_at"] = 0
+        self.state["last_swap_at"] = utc_now()
+        self.state["last_swap_asset"] = asset_id
+        try:
+            self.save()
+        except Exception:
+            self.state["pending_swap"] = pending
+            raise
+        self.warned_pending_swap = False
+        self.swap_notice = None
+        LOG.info("%s resource swap confirmed (asset=%s; amount=%s; remaining=%s)", self.wallet["address"], asset_id, amount, remaining)
+        return True
+
+    def auto_swap(self, *, force: bool = False) -> bool:
+        """Convert whole units of known resources to GEMS, never buy resources."""
+        if getattr(self.args, "skip_swap", False):
+            return False
+        posted = False
+        try:
+            now = time.time()
+            pending = self.state.get("pending_swap")
+            if pending:
+                if now < number(self.state.get("swap_check_at", 0), "swap check time"):
+                    return False
+                return self.reconcile_swap(self.get_swap_inventory())
+            if now < number(self.state.get("swap_retry_at", 0), "swap retry time"):
+                return False
+            if not force and now < number(self.state.get("swap_check_at", 0), "swap check time"):
+                return False
+            quantities = self.get_swap_inventory()
+            self.state["swap_check_at"] = now + SWAP_CHECK_SECONDS
+            allowed = SWAP_RESOURCE_IDS | (SWAP_GEM_IDS if getattr(self.args, "swap_gems", False) else frozenset())
+            available = {asset_id: quantity for asset_id, quantity in quantities.items()
+                         if asset_id in allowed and quantity >= 1}
+            if not available:
+                if self.swap_notice != "empty":
+                    LOG.info("%s no whole resource units to swap; gems and fractional inventory kept", self.wallet["address"])
+                    self.swap_notice = "empty"
+                self.save()
+                return False
+            rates = as_object(self.api.request("GET", "/trade/rates"))
+            values = rates.get("assetValues")
+            if not isinstance(values, dict):
+                raise ShapeError("Expected swap assetValues object")
+            chosen = None
+            for asset_id in sorted(available):
+                if asset_id not in values:
+                    continue
+                rate = decimal_number(values[asset_id], "swap unit value")
+                if rate <= 0:
+                    continue
+                quantity = available[asset_id]
+                amount = int(quantity)
+                if amount > MAX_API_INTEGER:
+                    raise ShapeError("Swap amount exceeds safe API integer range")
+                expected = (Decimal(amount) * rate).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
+                if expected < Decimal("0.01"):
+                    continue
+                chosen = (asset_id, quantity, amount, expected)
+                break
+            if chosen is None:
+                if self.swap_notice != "unquoted":
+                    LOG.info("%s no positive API quote for swappable inventory; resources kept", self.wallet["address"])
+                    self.swap_notice = "unquoted"
+                self.save()
+                return False
+            asset_id, quantity, amount, expected = chosen
+            self.state["pending_swap"] = {
+                "asset_id": asset_id, "amount": amount,
+                "quantity_before": str(quantity), "estimated_gems": str(expected),
+                "created_at": utc_now(),
+            }
+            try:
+                self.save()
+            except Exception:
+                self.state.pop("pending_swap", None)
+                raise
+            try:
+                posted = True
+                result = as_object(self.api.request("POST", "/trade/swap", {
+                    "fromAssetId": asset_id, "toAssetId": "GEMS", "amount": amount,
+                }))
+            except ApiError as error:
+                if 400 <= error.status < 500:
+                    self.state.pop("pending_swap", None)
+                    self.save()
+                raise
+            received = decimal_number(result.get("received"), "swap received")
+            if result.get("toAsset") != "GEMS" or received <= 0:
+                raise ShapeError("Swap did not acknowledge positive GEMS")
+            # Do not post again against potentially stale inventory, even on 2xx.
+            self.state["swap_check_at"] = 0
+            self.swap_notice = None
+            self.warned_pending_swap = False
+            LOG.info("%s resource swap submitted (asset=%s; amount=%d; received=%s GEMS); awaiting inventory readback", self.wallet["address"], asset_id, amount, received)
+            return True
+        except Stopped:
+            raise
+        except Exception as error:
+            self.defer_swap(error, readback_soon=posted and bool(self.state.get("pending_swap")))
+            return False
+
     def cycle(self) -> float:
         me = as_object(self.api.request("GET", "/user/me"), "user")
         self.api.verify_referral(me)
+        # Confirm yesterday's/last cycle's swap before quests or mining claims
+        # add more of the same resource and obscure the consumed quantity.
+        swapped = self.auto_swap() if self.state.get("pending_swap") else False
         try:
             quest_claimed = self.quests()
         except (ShapeError, ApiError) as error:
@@ -682,6 +868,7 @@ class Miner:
             positions = self.get_positions()
             me = as_object(self.api.request("GET", "/user/me"), "user")
             self.api.verify_referral(me)
+        swapped = self.auto_swap(force=bool(ready or quest_claimed)) or swapped
         # Use the same live energy source the frontend prefers, not a local estimate.
         stats = as_object(self.api.request("GET", "/mining/stats"))
         energy = number(stats.get("energy", me.get("energy")), "energy")
@@ -690,7 +877,7 @@ class Miner:
             profile["miningPower"] = stats["miningPower"]
         level = number(profile.get("level", 1), "level")
         power = number(profile.get("miningPower", 0), "miningPower")
-        upgraded = self.upgrade_power(profile, force=bool(ready or quest_claimed))
+        upgraded = self.upgrade_power(profile, force=bool(ready or quest_claimed or swapped))
         if upgraded:
             # Upgrades may award XP, but only the server decides the actual level.
             # Read both sources again before choosing a newly eligible mine.
@@ -728,7 +915,7 @@ class Miner:
             # This is the server snapshot before any new deployment below.
             LOG.info("%s mining check: energy=%g; level=%g; power=%g; occupied=%d; limit=%s; status=%s", self.wallet["address"], energy, level, power, occupied, limit if limit is not None else "none", status)
             self.next_status_log = now + STATUS_LOG_INTERVAL
-        delay = 0.5 if upgraded else self.args.interval
+        delay = 0.5 if upgraded or swapped else self.args.interval
         if pending:
             if not self.warned_pending:
                 LOG.warning("%s deployment result unknown; new openings paused until a new position appears. See --clear-pending", self.wallet["address"])
@@ -872,22 +1059,27 @@ def run_client(args, stop: threading.Event) -> int:
     with directory_lock(folder):
         secure_directory(folder / "state")
         # Maintenance must not accidentally create a new vault or extra wallets.
-        clear_upgrade = getattr(args, "clear_pending_upgrade", None)
-        if args.clear_pending is not None or clear_upgrade is not None:
-            address = args.clear_pending if args.clear_pending is not None else clear_upgrade
+        maintenance = [
+            ("deployment", args.clear_pending, "pending_open", ()),
+            ("upgrade", getattr(args, "clear_pending_upgrade", None), "pending_upgrade", ("upgrade_check_at", "upgrade_retry_at")),
+            ("swap", getattr(args, "clear_pending_swap", None), "pending_swap", ("swap_check_at", "swap_retry_at")),
+        ]
+        selected = [item for item in maintenance if item[1] is not None]
+        if len(selected) > 1:
+            raise WalletPaused("Choose only one pending marker to clear")
+        if selected:
+            action, address, marker, timers = selected[0]
             if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
                 raise WalletPaused("Invalid wallet address")
             path = folder / "state" / (address.lower() + ".json")
             if not path.is_file():
                 raise WalletPaused("No matching wallet state")
             state = read_json(path)
-            marker = "pending_open" if args.clear_pending is not None else "pending_upgrade"
             state.pop(marker, None)
-            if clear_upgrade is not None:
-                state.pop("upgrade_check_at", None)
-                state.pop("upgrade_retry_at", None)
+            for timer in timers:
+                state.pop(timer, None)
             write_json(path, state)
-            LOG.info("Pending %s marker cleared for %s", "deployment" if args.clear_pending is not None else "upgrade", address)
+            LOG.info("Pending %s marker cleared for %s", action, address)
             return 0
         if args.init_only:
             wallets = ensure_wallets(folder, args.wallets or 100, args.wallet_file)
@@ -896,7 +1088,9 @@ def run_client(args, stop: threading.Event) -> int:
         # Runtime is strictly read-only with respect to the wallet vault.
         wallets = load_wallets(args.wallet_file)
         LOG.info("Loaded %d wallets from %s; no wallets will be generated", len(wallets), args.wallet_file)
-        LOG.info("Auto power upgrades %s; when enabled, available GEMS are spent on miningPower only", "disabled" if getattr(args, "skip_upgrades", False) else "enabled")
+        upgrades_enabled = getattr(args, "auto_upgrades", False) and not getattr(args, "skip_upgrades", False)
+        LOG.info("Auto power upgrades %s; GEMS kept unless --auto-upgrades is explicitly enabled", "enabled" if upgrades_enabled else "disabled")
+        LOG.info("Auto resource swap %s; target=GEMS; include_gemstones=%s", "disabled" if getattr(args, "skip_swap", False) else "enabled", getattr(args, "swap_gems", False))
         request_stop = threading.Event()
         gate = RequestGate(args.request_interval, request_stop)
         miners = [Miner(wallet, folder, gate, args) for wallet in wallets]
@@ -916,14 +1110,19 @@ def main(argv=None) -> int:
     parser.add_argument("--location-id", help="Only deploy to this location; still requires sufficient level, power and energy")
     parser.add_argument("--max-positions", type=int, help="Optional per-wallet client cap; by default no client-side position cap")
     parser.add_argument("--skip-quests", action="store_true")
-    parser.add_argument("--skip-upgrades", action="store_true", help="Disable automatic GEMS spending on miningPower upgrades (enabled by default)")
+    upgrade_options = parser.add_mutually_exclusive_group()
+    upgrade_options.add_argument("--auto-upgrades", action="store_true", help="Opt in to spending available GEMS on miningPower upgrades (off by default)")
+    upgrade_options.add_argument("--skip-upgrades", action="store_true", help="Keep upgrades disabled; compatible with older startup commands")
+    parser.add_argument("--skip-swap", action="store_true", help="Disable automatic whole-resource swaps to GEMS (enabled by default)")
+    parser.add_argument("--swap-gems", action="store_true", help="Also swap gemstone items to GEMS; by default gemstones are kept")
     parser.add_argument("--init-only", action="store_true", help="Create local wallet file without any network requests")
     parser.add_argument("--resume", action="store_true", help="Compatibility option; failed wallets now retry automatically")
     maintenance_options = parser.add_mutually_exclusive_group()
     maintenance_options.add_argument("--clear-pending", metavar="ADDRESS", help="After manual server-side verification, clear one uncertain deployment and exit")
     maintenance_options.add_argument("--clear-pending-upgrade", metavar="ADDRESS", help="After manual server-side verification, clear one uncertain power purchase and exit")
+    maintenance_options.add_argument("--clear-pending-swap", metavar="ADDRESS", help="After manual server-side verification, clear one uncertain resource swap and exit")
     args = parser.parse_args(argv)
-    for option in ("clear_pending", "clear_pending_upgrade"):
+    for option in ("clear_pending", "clear_pending_upgrade", "clear_pending_swap"):
         address = getattr(args, option)
         if address is not None and not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
             parser.error(f"--{option.replace('_', '-')} requires a valid wallet address")
@@ -947,7 +1146,7 @@ def main(argv=None) -> int:
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), request_shutdown)
     args.wallet_file = args.wallet_file.expanduser().resolve()
-    maintenance = args.init_only or args.clear_pending is not None or args.clear_pending_upgrade is not None
+    maintenance = args.init_only or any(getattr(args, option) is not None for option in ("clear_pending", "clear_pending_upgrade", "clear_pending_swap"))
     while not stop.is_set():
         try:
             result = run_client(args, stop)

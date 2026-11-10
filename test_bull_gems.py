@@ -419,7 +419,8 @@ class MinerTests(unittest.TestCase):
         self.temp = local_temp()
         folder = Path(self.temp.name)
         bg.secure_directory(folder / "state")
-        args = SimpleNamespace(ref_code=bg.REF_CODE, interval=15, skip_quests=True, skip_upgrades=True, location_id=None)
+        args = SimpleNamespace(ref_code=bg.REF_CODE, interval=15, skip_quests=True,
+                               skip_upgrades=True, skip_swap=True, location_id=None)
         self.miner = bg.Miner(wallet(), folder, Gate(), args)
         self.miner.api.session.close()
         self.api = self.miner.api = FakeMiningApi(self.miner.wallet, self.miner.state)

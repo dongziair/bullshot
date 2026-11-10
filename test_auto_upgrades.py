@@ -78,7 +78,8 @@ class AutoUpgradeTests(unittest.TestCase):
         self.network_guard.start()
         self.addCleanup(self.network_guard.stop)
         args = SimpleNamespace(ref_code=bg.REF_CODE, interval=15, skip_quests=True,
-                               skip_upgrades=False, location_id=None, max_positions=None)
+                               auto_upgrades=True, skip_upgrades=False, skip_swap=True,
+                               location_id=None, max_positions=None)
         self.miner = bg.Miner(fixtures.wallet(), self.root, fixtures.Gate(), args)
         self.miner.api.session.close()
         self.api = self.miner.api = UpgradeApi(self.miner.wallet, self.miner.state)
@@ -109,8 +110,8 @@ class AutoUpgradeTests(unittest.TestCase):
         self.api.apply_on_error = False
         self.api.new_level = None
 
-    def test_default_cycle_upgrades_once_then_still_mines(self):
-        # No caller flag means the public CLI/default compatibility path is on.
+    def test_opted_in_cycle_upgrades_once_then_still_mines(self):
+        # The compatibility skip flag is optional, but buying requires opt-in.
         del self.miner.args.skip_upgrades
         self.assertEqual(self.miner.tick(), 0.5)
         self.assertEqual(self.api.upgrade_attempts, 1)
@@ -120,6 +121,23 @@ class AutoUpgradeTests(unittest.TestCase):
         self.assertEqual(self.api.mining_power, 25)
         self.assertEqual(self.miner.tick(), 0.5)
         self.assertEqual(self.api.upgrade_attempts, 2)
+
+    def test_default_or_missing_opt_in_retains_gems_and_still_mines(self):
+        for mode in ("disabled", "missing"):
+            with self.subTest(mode=mode):
+                self.reset_upgrade_state()
+                if mode == "disabled":
+                    self.miner.args.auto_upgrades = False
+                else:
+                    del self.miner.args.auto_upgrades
+                before = self.api.open_attempts
+                self.assertFalse(self.miner.upgrade_power(self.profile(), force=True))
+                self.assertEqual(self.miner.tick(), 0.5)
+                self.assertEqual(self.api.open_attempts, before + 1)
+                self.assertEqual(self.api.upgrade_attempts, 0)
+                self.assertEqual(self.api.balance["gems"], 100)
+                self.assertFalse(any(path in {"/user/balance", "/upgrades"}
+                                     for _, path, _ in self.api.calls))
 
     def test_skip_flag_disables_upgrade_requests_without_blocking_mining(self):
         self.miner.args.skip_upgrades = True
@@ -403,19 +421,28 @@ class AutoUpgradeTests(unittest.TestCase):
 
 
 class UpgradeCliTests(unittest.TestCase):
-    def test_automatic_upgrades_default_on_and_skip_flag_is_explicit(self):
-        for arguments, expected in (([], False), (["--skip-upgrades"], True)):
+    def test_automatic_upgrades_default_off_and_require_explicit_opt_in(self):
+        cases = (([], (False, False)), (["--auto-upgrades"], (True, False)),
+                 (["--skip-upgrades"], (False, True)))
+        for arguments, expected in cases:
             with self.subTest(arguments=arguments):
                 captured = []
 
                 def run_client(args, stop):
-                    captured.append(args.skip_upgrades)
+                    captured.append((args.auto_upgrades, args.skip_upgrades))
                     stop.set()
                     return 0
 
                 with patch.object(bg.signal, "signal"), patch.object(bg, "run_client", side_effect=run_client):
                     self.assertEqual(bg.main(arguments), 0)
                 self.assertEqual(captured, [expected])
+
+    def test_upgrade_opt_in_and_legacy_skip_flags_are_mutually_exclusive(self):
+        with patch.object(bg, "run_client") as run, patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as result:
+                bg.main(["--auto-upgrades", "--skip-upgrades"])
+        self.assertEqual(result.exception.code, 2)
+        run.assert_not_called()
 
     def test_clear_pending_upgrade_only_removes_upgrade_markers_and_never_loads_wallets(self):
         with fixtures.local_temp() as directory:

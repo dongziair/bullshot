@@ -1,6 +1,6 @@
 {
-  "last_turn_at": "2026-11-10T01:37:03.593Z",
-  "turn_count": 32,
-  "last_progress_at": "2026-11-10T01:37:03.593Z",
-  "last_agent_output": "已改好：[新版脚本包](D:/个人/bullshot/bull_gems.zip)。\n\n默认逻辑：\n- **只自动升级算力**，余额够就持续升级，每轮最多一次，**不预留 GEMS**。\n- 升级后重"
+  "last_turn_at": "2026-11-10T03:36:46.017Z",
+  "turn_count": 47,
+  "last_progress_at": "2026-11-10T03:36:46.017Z",
+  "last_agent_output": "**已关闭自动升级**，并加入资源自动换 GEMS：[新版脚本包](D:/个人/bullshot/bull_gems.zip)。默认兑换原矿、精炼部件，宝石保留；兑换异常不影响挖矿。\n\n### 最低级"
 }
