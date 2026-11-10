@@ -36,6 +36,8 @@ QUEST_IDS = {"daily_miner_signin", "weekly_miner_checkin"}
 ENERGY_COST = 5
 DURATION_SECONDS = 60
 MAX_POSITIONS = 5
+HTTP_TIMEOUT = (10, 30)
+STATUS_LOG_INTERVAL = 300
 LOG = logging.getLogger("bull_gems")
 
 
@@ -305,21 +307,29 @@ class Api:
         if auth:
             headers["Authorization"] = "Bearer " + self.state.get("token", "")
         # No automatic POST retries and no redirect forwarding of credentials.
-        with self.session.request(
-            method, API_BASE + path, json=body, headers=headers,
-            timeout=(10, 30), allow_redirects=False,
-        ) as response:
-            if not 200 <= response.status_code < 300:
-                delay = retry_seconds(response.headers.get("Retry-After")) if response.status_code == 429 else 0
-                if response.status_code == 429:
-                    self.gate.pause(delay)
-                raise ApiError(response.status_code, delay)
-            if response.status_code == 204:
-                return {}
-            try:
-                return response.json()
-            except ValueError:
-                raise ShapeError("API returned non-JSON success response") from None
+        started = time.monotonic()
+        try:
+            with self.session.request(
+                method, API_BASE + path, json=body, headers=headers,
+                timeout=HTTP_TIMEOUT, allow_redirects=False,
+            ) as response:
+                if not 200 <= response.status_code < 300:
+                    delay = retry_seconds(response.headers.get("Retry-After")) if response.status_code == 429 else 0
+                    if response.status_code == 429:
+                        self.gate.pause(delay)
+                    raise ApiError(response.status_code, delay)
+                if response.status_code == 204:
+                    return {}
+                try:
+                    return response.json()
+                except ValueError:
+                    raise ShapeError("API returned non-JSON success response") from None
+        except requests.RequestException as error:
+            # Keep the original exception type and POST uncertainty semantics.
+            # Never log its text, headers, request body or URL query parameters.
+            error.bull_gems_operation = f"{method.upper()} {path.split('?', 1)[0]}"
+            error.bull_gems_elapsed = time.monotonic() - started
+            raise
 
     def verify_referral(self, me: dict) -> bool:
         # Referral confirmation is informational, never a prerequisite for mining.
@@ -418,6 +428,7 @@ class Miner:
         self.locations_at = 0.0
         self.warned_no_location = False
         self.warned_pending = False
+        self.next_status_log = 0.0
 
     def load_state(self) -> None:
         data = read_json(self.path) if self.path.exists() else {}
@@ -519,6 +530,17 @@ class Miner:
         stats = as_object(self.api.request("GET", "/mining/stats"))
         energy = number(stats.get("energy", me.get("energy")), "energy")
         active = [p for p in positions if p["status"] not in {"claimed", "cancelled", "canceled"}]
+        now = time.monotonic()
+        if now >= self.next_status_log:
+            status = (
+                "pending_confirmation" if pending else
+                "waiting_energy" if energy < ENERGY_COST else
+                "positions_full" if len(active) >= MAX_POSITIONS else
+                "checking_location"
+            )
+            # This is the server snapshot before any new deployment below.
+            LOG.info("%s mining check: energy=%g; occupied=%d/%d; status=%s", self.wallet["address"], energy, len(active), MAX_POSITIONS, status)
+            self.next_status_log = now + STATUS_LOG_INTERVAL
         delay = self.args.interval
         if pending:
             if not self.warned_pending:
@@ -593,6 +615,12 @@ class Miner:
             elif isinstance(error, (WalletPaused, ShapeError)):
                 delay = max(delay, 300)
                 label = str(error)
+            elif isinstance(error, requests.RequestException):
+                label = type(error).__name__
+                operation = getattr(error, "bull_gems_operation", None)
+                elapsed = getattr(error, "bull_gems_elapsed", None)
+                if isinstance(operation, str) and isinstance(elapsed, (int, float)):
+                    label += f" {operation} (elapsed={elapsed:.1f}s)"
             else:
                 label = type(error).__name__
             # Never overwrite an unreadable state: it may hold an uncertain POST.

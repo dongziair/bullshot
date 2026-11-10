@@ -166,6 +166,21 @@ class ApiTests(unittest.TestCase):
             api.request("POST", "/mining/positions", {"locationId": "mine"})
         self.assertEqual(len(api.session.calls), 1)
 
+    def test_read_timeout_retains_safe_request_context_without_changing_exception_type(self):
+        api = self.api([requests.ReadTimeout("SECRET-DO-NOT-LOG")], token="token")
+        with self.assertRaises(requests.ReadTimeout) as raised:
+            api.request("GET", "/mining/stats")
+        self.assertEqual(getattr(raised.exception, "bull_gems_operation", None), "GET /mining/stats")
+        self.assertGreaterEqual(raised.exception.bull_gems_elapsed, 0)
+        self.assertEqual(len(api.session.calls), 1)
+
+    def test_transport_error_context_omits_url_query(self):
+        api = self.api([requests.ReadTimeout("SECRET-DO-NOT-LOG")], token="token")
+        with self.assertRaises(requests.ReadTimeout) as raised:
+            api.request("GET", "/mining/stats?token=SECRET-QUERY")
+        self.assertEqual(raised.exception.bull_gems_operation, "GET /mining/stats")
+        self.assertNotIn("SECRET", raised.exception.bull_gems_operation)
+
     def test_429_pauses_all_clients(self):
         api = self.api([Response(status=429, headers={"Retry-After": "123"})], token="t")
         with self.assertRaises(bg.ApiError) as error:
@@ -367,6 +382,42 @@ class MinerTests(unittest.TestCase):
         self.assertEqual(self.api.open_attempts, 1)
         self.assertEqual(self.miner.state["referral_status"], "empty")
         self.assertNotIn("retry_at", self.miner.state)
+
+    def test_read_timeout_log_identifies_endpoint_without_exposing_exception_body(self):
+        self.miner.state["token"] = "TEST-TOKEN-DO-NOT-LOG"
+        api = bg.Api(self.miner.wallet, self.miner.state, self.miner.save, Gate(), bg.REF_CODE)
+        api.session.close()
+        api.session = Session([requests.ReadTimeout("SECRET-DO-NOT-LOG")])
+        self.miner.api = api
+        with self.assertLogs(bg.LOG, level="WARNING") as logs:
+            delay = self.miner.tick()
+        output = "\n".join(logs.output)
+        self.assertGreaterEqual(delay, 15)
+        self.assertIn("ReadTimeout", output)
+        self.assertIn("GET /user/me", output)
+        self.assertIn("elapsed=", output)
+        self.assertNotIn("SECRET-DO-NOT-LOG", output)
+        self.assertNotIn("TEST-TOKEN-DO-NOT-LOG", output)
+        self.assertEqual(len(api.session.calls), 1)
+
+    def test_idle_mining_status_is_printed_periodically_without_extra_requests(self):
+        self.api.energy = 0
+        with patch.object(bg.time, "monotonic", side_effect=[100, 101, 401]), self.assertLogs(bg.LOG, level="INFO") as logs:
+            for _ in range(3):
+                self.assertEqual(self.miner.tick(), 15)
+        snapshots = [line for line in logs.output if "mining check:" in line]
+        self.assertEqual(len(snapshots), 2)
+        self.assertIn("energy=0", snapshots[0])
+        self.assertIn("occupied=0/5", snapshots[0])
+        self.assertIn("waiting_energy", snapshots[0])
+        self.assertEqual(len(self.api.calls), 9)
+
+    def test_successful_cycle_resets_timeout_backoff(self):
+        with patch.object(self.miner, "cycle", side_effect=[requests.ReadTimeout(), 15, requests.ReadTimeout()]), patch.object(bg.random, "uniform", return_value=0):
+            self.assertEqual(self.miner.tick(), 15)
+            self.assertEqual(self.miner.tick(), 15)
+            self.assertEqual(self.miner.tick(), 15)
+        self.assertEqual(self.miner.failures, 1)
 
     def test_omitted_referral_does_not_block_quests_or_mining(self):
         self.api.me.pop("referredBy")
