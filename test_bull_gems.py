@@ -294,6 +294,85 @@ class StorageTests(unittest.TestCase):
                         pass
 
 
+class LocationSelectionTests(unittest.TestCase):
+    @staticmethod
+    def location(identifier, level=1, power=0, cost=5, duration=60, **extra):
+        return {"id": identifier, "levelRequired": level, "miningPowerRequired": power,
+                "energyCost": cost, "durationSeconds": duration, **extra}
+
+    def test_prefers_highest_eligible_level_not_id_or_cheapest_mine(self):
+        starter = self.location("a-starter")
+        middle = self.location("b-middle", level=4, power=25, cost=20, duration=1800)
+        advanced = self.location("z-advanced", level=8, power=60, cost=35, duration=5400)
+        selected = bg.choose_location([starter, advanced, middle], {"level": 8, "miningPower": 60}, None, 100)
+        self.assertIs(selected, advanced)
+
+    def test_level_and_power_must_both_meet_requirements(self):
+        starter = self.location("starter")
+        too_high_level = self.location("level-locked", level=9, power=0)
+        too_high_power = self.location("power-locked", level=4, power=61)
+        self.assertIs(bg.choose_location([too_high_level, too_high_power, starter], {"level": 8, "miningPower": 60}, None, 100), starter)
+
+    def test_expensive_high_level_falls_back_to_affordable_eligible_mine(self):
+        starter = self.location("starter")
+        advanced = self.location("advanced", level=8, power=60, cost=35)
+        self.assertIs(bg.choose_location([advanced, starter], {"level": 8, "miningPower": 60}, None, 10), starter)
+        self.assertIs(bg.choose_location([advanced, starter], {"level": 8, "miningPower": 60}, None, 35), advanced)
+
+    def test_locked_or_inactive_locations_are_excluded(self):
+        starter = self.location("starter")
+        for flag in ("isUnlocked", "unlocked", "isActive"):
+            with self.subTest(flag=flag):
+                blocked = self.location("blocked", level=4, **{flag: False})
+                self.assertIs(bg.choose_location([blocked, starter], {"level": 8, "miningPower": 60}, None, 100), starter)
+
+    def test_requested_location_does_not_bypass_eligibility_or_fall_back(self):
+        starter = self.location("starter")
+        requested = self.location("advanced", level=8, power=60, cost=35)
+        cases = [({"level": 7, "miningPower": 60}, 100),
+                 ({"level": 8, "miningPower": 59}, 100),
+                 ({"level": 8, "miningPower": 60}, 34)]
+        for me, energy in cases:
+            with self.subTest(me=me, energy=energy):
+                self.assertIsNone(bg.choose_location([starter, requested], me, "advanced", energy))
+        self.assertIs(bg.choose_location([starter, requested], {"level": 8, "miningPower": 60}, "starter", 100), starter)
+        self.assertIsNone(bg.choose_location([starter], {"level": 8, "miningPower": 60}, "missing", 100))
+
+    def test_tie_breaks_by_power_then_cost_duration_and_id(self):
+        me = {"level": 8, "miningPower": 60}
+        cases = [
+            (self.location("winner", power=25, cost=20), self.location("other", power=0, cost=5)),
+            (self.location("winner", power=25, cost=10), self.location("other", power=25, cost=20)),
+            (self.location("winner", power=25, duration=60), self.location("other", power=25, duration=600)),
+            (self.location("a-winner", power=25), self.location("z-other", power=25)),
+        ]
+        for winner, other in cases:
+            with self.subTest(winner=winner, other=other):
+                self.assertIs(bg.choose_location([other, winner], me, None, 100), winner)
+
+    def test_numeric_strings_and_duration_minutes_are_supported(self):
+        mine = {"id": "minutes", "levelRequired": "4", "miningPowerRequired": "25", "energyCost": "20", "durationMinutes": "30"}
+        self.assertIs(bg.choose_location([mine], {"level": "4", "miningPower": "25"}, None, 20), mine)
+
+    def test_invalid_cost_or_duration_never_selects_a_location(self):
+        for field in ("energyCost", "durationSeconds"):
+            for value in (None, False, -1, 0, float("nan"), float("inf")):
+                with self.subTest(field=field, value=value):
+                    mine = self.location("invalid", **{field: value})
+                    with self.assertRaises(bg.ShapeError):
+                        bg.choose_location([mine], {"level": 8, "miningPower": 60}, None, 100)
+
+    def test_empty_or_unaffordable_locations_return_none(self):
+        me = {"level": 8, "miningPower": 60}
+        self.assertIsNone(bg.choose_location([], me, None, 100))
+        self.assertIsNone(bg.choose_location([self.location("starter")], me, None, 4))
+
+    def test_unaffordable_location_missing_duration_does_not_block_affordable_mine(self):
+        expensive = {"id": "expensive", "levelRequired": 8, "energyCost": 100}
+        starter = self.location("starter")
+        self.assertIs(bg.choose_location([expensive, starter], {"level": 8, "miningPower": 60}, None, 10), starter)
+
+
 class FakeMiningApi:
     verify_referral = bg.Api.verify_referral
 
@@ -302,6 +381,7 @@ class FakeMiningApi:
         self.state = state
         self.calls = []
         self.energy = 10
+        self.mining_power = None
         self.me = {"referredBy": "yes", "level": 1, "energy": 10, "miningPower": 0}
         self.positions = []
         self.locations = [{"id": "starter", "energyCost": 5, "durationSeconds": 60}]
@@ -313,10 +393,13 @@ class FakeMiningApi:
     def request(self, method, path, body=None):
         self.calls.append((method, path, body))
         if method == "GET":
+            stats = {"energy": self.energy}
+            if self.mining_power is not None:
+                stats["miningPower"] = self.mining_power
             return {
                 "/user/me": self.me,
                 "/mining/positions": list(self.positions),
-                "/mining/stats": {"energy": self.energy},
+                "/mining/stats": stats,
                 "/mining/locations": self.locations,
                 "/quests": self.quests,
             }[path]
@@ -336,7 +419,7 @@ class MinerTests(unittest.TestCase):
         self.temp = local_temp()
         folder = Path(self.temp.name)
         bg.secure_directory(folder / "state")
-        args = SimpleNamespace(ref_code=bg.REF_CODE, interval=15, skip_quests=True, location_id=None)
+        args = SimpleNamespace(ref_code=bg.REF_CODE, interval=15, skip_quests=True, skip_upgrades=True, location_id=None)
         self.miner = bg.Miner(wallet(), folder, Gate(), args)
         self.miner.api.session.close()
         self.api = self.miner.api = FakeMiningApi(self.miner.wallet, self.miner.state)
@@ -354,9 +437,29 @@ class MinerTests(unittest.TestCase):
         self.assertEqual(self.api.open_attempts, 1)
         self.assertNotIn("pending_open", self.miner.state)
 
-    def test_five_occupied_positions_prevent_opening(self):
+    def test_default_has_no_five_position_limit(self):
+        for occupied in (5, 10):
+            with self.subTest(occupied=occupied):
+                self.api.positions = [{"id": str(i), "status": "active"} for i in range(occupied)]
+                before = self.api.open_attempts
+                self.assertEqual(self.miner.tick(), 0.5)
+                self.assertEqual(self.api.open_attempts, before + 1)
+
+    def test_explicit_position_limit_blocks_new_opening(self):
+        self.miner.args.max_positions = 5
         self.api.positions = [{"id": str(i), "status": "active"} for i in range(5)]
+        with self.assertLogs(bg.LOG, level="INFO") as logs:
+            self.assertEqual(self.miner.tick(), 15)
+        self.assertEqual(self.api.open_attempts, 0)
+        snapshot = next(line for line in logs.output if "mining check:" in line)
+        self.assertIn("limit=5", snapshot)
+        self.assertIn("positions_full", snapshot)
+
+    def test_explicit_position_limit_still_claims_ready_positions_first(self):
+        self.miner.args.max_positions = 5
+        self.api.positions = [{"id": str(i), "status": "active"} for i in range(5)] + [{"id": "ready1", "status": "ready"}]
         self.assertEqual(self.miner.tick(), 15)
+        self.assertIn(("POST", "/mining/positions/ready1/claim", None), self.api.calls)
         self.assertEqual(self.api.open_attempts, 0)
 
     def test_live_stats_energy_takes_precedence(self):
@@ -365,9 +468,72 @@ class MinerTests(unittest.TestCase):
         self.assertEqual(self.miner.tick(), 15)
         self.assertEqual(self.api.open_attempts, 0)
 
-    def test_no_more_expensive_fallback(self):
+    def test_eligible_mine_can_cost_more_and_take_longer_than_original_entry_mine(self):
         self.api.locations = [{"id": "quarry", "energyCost": 10, "durationSeconds": 600}]
-        self.miner.tick()
+        self.assertEqual(self.miner.tick(), 0.5)
+        self.assertEqual(self.api.open_attempts, 1)
+        self.assertIn(("POST", "/mining/positions", {"locationId": "quarry"}), self.api.calls)
+
+    def test_selects_highest_eligible_level_using_live_stats_power(self):
+        self.api.me.update({"level": 8, "miningPower": 0})
+        self.api.mining_power = 60
+        self.api.energy = 100
+        self.api.locations = [LocationSelectionTests.location("starter"), LocationSelectionTests.location("advanced", level=8, power=60, cost=35, duration=5400)]
+        with self.assertLogs(bg.LOG, level="INFO") as logs:
+            self.assertEqual(self.miner.tick(), 0.5)
+        self.assertIn(("POST", "/mining/positions", {"locationId": "advanced"}), self.api.calls)
+        deployed = next(line for line in logs.output if "miner deployed" in line)
+        for expected in ("location=advanced", "level_required=8", "power_required=60", "cost=35", "duration=5400", "energy_before=100"):
+            self.assertIn(expected, deployed)
+
+    def test_live_stats_zero_power_does_not_fall_back_to_higher_profile_power(self):
+        self.api.me.update({"level": 8, "miningPower": 60})
+        self.api.mining_power = 0
+        self.api.energy = 100
+        self.api.locations = [LocationSelectionTests.location("advanced", level=8, power=60, cost=35)]
+        self.assertEqual(self.miner.tick(), 15)
+        self.assertEqual(self.api.open_attempts, 0)
+
+    def test_level_change_refreshes_cached_locations_and_selects_newly_unlocked_mine(self):
+        self.api.energy = 100
+        self.api.me.update({"level": 1, "miningPower": 60})
+        self.api.locations = [LocationSelectionTests.location("starter"), LocationSelectionTests.location("advanced", level=8, power=60, cost=35, isUnlocked=False)]
+        self.assertEqual(self.miner.tick(), 0.5)
+        self.api.me["level"] = 8
+        self.api.locations = [LocationSelectionTests.location("starter"), LocationSelectionTests.location("advanced", level=8, power=60, cost=35, isUnlocked=True)]
+        self.assertEqual(self.miner.tick(), 0.5)
+        self.assertEqual(sum(path == "/mining/locations" for method, path, _ in self.api.calls if method == "GET"), 2)
+        self.assertEqual([body["locationId"] for method, path, body in self.api.calls if method == "POST" and path == "/mining/positions"], ["starter", "advanced"])
+
+    def test_power_change_refreshes_cached_locations_and_selects_newly_eligible_mine(self):
+        self.api.energy = 100
+        self.api.me["level"] = 8
+        self.api.mining_power = 0
+        self.api.locations = [LocationSelectionTests.location("starter"), LocationSelectionTests.location("advanced", level=8, power=60, cost=35, isUnlocked=False)]
+        self.assertEqual(self.miner.tick(), 0.5)
+        self.api.mining_power = 60
+        self.api.locations = [LocationSelectionTests.location("starter"), LocationSelectionTests.location("advanced", level=8, power=60, cost=35, isUnlocked=True)]
+        self.assertEqual(self.miner.tick(), 0.5)
+        self.assertEqual(sum(path == "/mining/locations" for method, path, _ in self.api.calls if method == "GET"), 2)
+        self.assertEqual([body["locationId"] for method, path, body in self.api.calls if method == "POST" and path == "/mining/positions"], ["starter", "advanced"])
+
+    def test_unchanged_profile_reuses_location_cache_until_five_minute_expiry(self):
+        with patch.object(bg.time, "time", return_value=1000):
+            self.assertEqual(self.miner.tick(), 0.5)
+        with patch.object(bg.time, "time", return_value=1010):
+            self.assertEqual(self.miner.tick(), 0.5)
+        calls_before_expiry = sum(path == "/mining/locations" for method, path, _ in self.api.calls if method == "GET")
+        self.assertEqual(calls_before_expiry, 1)
+        with patch.object(bg.time, "time", return_value=1301):
+            self.assertEqual(self.miner.tick(), 0.5)
+        self.assertEqual(sum(path == "/mining/locations" for method, path, _ in self.api.calls if method == "GET"), 2)
+
+    def test_requested_unaffordable_mine_does_not_fall_back_to_cheaper_mine(self):
+        self.api.me.update({"level": 8, "miningPower": 60})
+        self.api.energy = 10
+        self.api.locations = [LocationSelectionTests.location("starter"), LocationSelectionTests.location("advanced", level=8, power=60, cost=35)]
+        self.miner.args.location_id = "advanced"
+        self.assertEqual(self.miner.tick(), 15)
         self.assertEqual(self.api.open_attempts, 0)
 
     def test_unrecognized_status_prevents_mutation(self):
@@ -408,7 +574,9 @@ class MinerTests(unittest.TestCase):
         snapshots = [line for line in logs.output if "mining check:" in line]
         self.assertEqual(len(snapshots), 2)
         self.assertIn("energy=0", snapshots[0])
-        self.assertIn("occupied=0/5", snapshots[0])
+        self.assertIn("occupied=0", snapshots[0])
+        self.assertIn("limit=none", snapshots[0])
+        self.assertNotIn("occupied=0/5", snapshots[0])
         self.assertIn("waiting_energy", snapshots[0])
         self.assertEqual(len(self.api.calls), 9)
 
@@ -596,6 +764,28 @@ class SchedulerTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_cli_position_limit_defaults_to_none_and_accepts_positive_integer(self):
+        for arguments, expected in (([], None), (["--max-positions", "17"], 17)):
+            with self.subTest(arguments=arguments):
+                captured = []
+
+                def run_client(args, stop):
+                    captured.append(args.max_positions)
+                    stop.set()
+                    return 0
+
+                with patch.object(bg.signal, "signal"), patch.object(bg, "run_client", side_effect=run_client):
+                    self.assertEqual(bg.main(arguments), 0)
+                self.assertEqual(captured, [expected])
+
+    def test_cli_rejects_nonpositive_or_noninteger_position_limits(self):
+        with patch.object(bg, "run_client") as run:
+            for value in ("0", "-1", "1.5", "abc"):
+                with self.subTest(value=value), self.assertRaises(SystemExit) as raised:
+                    bg.main(["--max-positions", value])
+                self.assertEqual(raised.exception.code, 2)
+        run.assert_not_called()
+
     def test_terminal_signals_stop_runtime_without_retry_or_generation(self):
         for name in ("SIGINT", "SIGTERM", "SIGHUP"):
             if not hasattr(bg.signal, name):

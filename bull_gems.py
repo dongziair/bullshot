@@ -33,11 +33,11 @@ SITE = "https://gem.bullshot.io"
 SIGN_PREFIX = "Sign in to Bull GEM on Base: "
 REF_CODE = "0x75527f54"
 QUEST_IDS = {"daily_miner_signin", "weekly_miner_checkin"}
-ENERGY_COST = 5
-DURATION_SECONDS = 60
-MAX_POSITIONS = 5
 HTTP_TIMEOUT = (10, 30)
 STATUS_LOG_INTERVAL = 300
+LOCATION_CACHE_SECONDS = 300
+UPGRADE_CHECK_SECONDS = 60
+UPGRADE_RETRY_SECONDS = 300
 LOG = logging.getLogger("bull_gems")
 
 
@@ -389,25 +389,40 @@ class Api:
         return self.raw(method, path, body)
 
 
-def choose_location(locations: list[dict], me: dict, requested: str | None) -> dict | None:
+def location_duration(location: dict) -> float:
+    duration = location.get("durationSeconds")
+    if duration is None and "durationMinutes" in location:
+        duration = number(location["durationMinutes"], "durationMinutes") * 60
+    seconds = number(duration, "durationSeconds")
+    if seconds <= 0:
+        raise ShapeError("Mining location duration must be positive")
+    return seconds
+
+
+def choose_location(locations: list[dict], me: dict, requested: str | None, energy: float) -> dict | None:
+    level = number(me.get("level", 1), "level")
+    power = number(me.get("miningPower", 0), "miningPower")
+    budget = number(energy, "energy")
     candidates = []
     for location in locations:
         if requested is not None and item_id(location) != requested:
             continue
-        cost = number(location.get("energyCost"), "energyCost")
-        duration = location.get("durationSeconds")
-        if duration is None and "durationMinutes" in location:
-            duration = number(location["durationMinutes"], "durationMinutes") * 60
-        if cost != ENERGY_COST or number(duration, "durationSeconds") != DURATION_SECONDS:
-            continue
         if location.get("isUnlocked") is False or location.get("unlocked") is False or location.get("isActive") is False:
             continue
-        if number(location.get("levelRequired", 1), "levelRequired") > number(me.get("level", 1), "level"):
+        required_level = number(location.get("levelRequired", 1), "levelRequired")
+        required_power = number(location.get("miningPowerRequired", 0), "miningPowerRequired")
+        if required_level > level or required_power > power:
             continue
-        if number(location.get("miningPowerRequired", 0), "miningPowerRequired") > number(me.get("miningPower", 0), "miningPower"):
+        cost = number(location.get("energyCost"), "energyCost")
+        if cost <= 0:
+            raise ShapeError("Mining location energyCost must be positive")
+        if cost > budget:
             continue
-        candidates.append(location)
-    return sorted(candidates, key=item_id)[0] if candidates else None
+        duration = location_duration(location)
+        # Highest eligible level first, not an unsupported claim about profit.
+        rank = (-required_level, -required_power, cost, duration, item_id(location))
+        candidates.append((rank, location))
+    return min(candidates, key=lambda candidate: candidate[0])[1] if candidates else None
 
 
 class Miner:
@@ -426,8 +441,11 @@ class Miner:
         self.failures = 0
         self.locations = None
         self.locations_at = 0.0
+        self.locations_profile = None
         self.warned_no_location = False
         self.warned_pending = False
+        self.warned_pending_upgrade = False
+        self.upgrade_notice = None
         self.next_status_log = 0.0
 
     def load_state(self) -> None:
@@ -498,6 +516,144 @@ class Miner:
         self.save()
         return claimed
 
+    def defer_upgrade(self, error: Exception) -> None:
+        """Optional purchases have their own cooldown, not a mining failure."""
+        delay = UPGRADE_RETRY_SECONDS
+        if isinstance(error, ApiError):
+            delay = max(delay, error.retry_after)
+            label = f"HTTP {error.status}"
+        elif isinstance(error, ShapeError):
+            label = str(error)
+        else:
+            # Request exceptions can contain credentials or server response text.
+            label = type(error).__name__
+            if isinstance(error, requests.RequestException):
+                operation = getattr(error, "bull_gems_operation", None)
+                elapsed = getattr(error, "bull_gems_elapsed", None)
+                if isinstance(operation, str) and isinstance(elapsed, (int, float)):
+                    label += f" {operation} (elapsed={elapsed:.1f}s)"
+        self.state["upgrade_retry_at"] = time.time() + delay
+        try:
+            self.save()
+        except Exception:
+            # Keep pending purchases in memory even when local storage fails.
+            pass
+        LOG.warning("%s power upgrade deferred: %s; retry in %gs; mining continues", self.wallet["address"], label, delay)
+
+    def reconcile_power_upgrade(self, profile: dict) -> bool:
+        pending = self.state.get("pending_upgrade")
+        if not pending:
+            return False
+        if not isinstance(pending, dict):
+            raise ShapeError("Invalid pending power upgrade")
+        before = number(pending.get("power_before"), "pending upgrade power")
+        power = number(profile.get("miningPower"), "miningPower")
+        if power <= before:
+            if not self.warned_pending_upgrade:
+                LOG.warning("%s power upgrade awaiting readback; new upgrades paused, mining continues. See --clear-pending-upgrade", self.wallet["address"])
+                self.warned_pending_upgrade = True
+            return False
+        self.state.pop("pending_upgrade", None)
+        self.state["upgrade_check_at"] = 0
+        self.state["upgrade_retry_at"] = 0
+        self.state["last_power_upgrade_at"] = utc_now()
+        try:
+            self.save()
+        except Exception:
+            # Do not lose the durable uncertain-purchase marker on a failed save.
+            self.state["pending_upgrade"] = pending
+            raise
+        self.warned_pending_upgrade = False
+        self.upgrade_notice = None
+        LOG.info("%s power upgrade reconciled (power_before=%g; power_after=%g)", self.wallet["address"], before, power)
+        return True
+
+    def upgrade_power(self, profile: dict, *, force: bool = False) -> bool:
+        """Buy at most one power upgrade, then require authoritative readback.
+
+        Never buy speed/capacity, guess prices, or replay an uncertain purchase.
+        Errors in this optional action must not prevent claims or deployments.
+        """
+        if getattr(self.args, "skip_upgrades", False):
+            return False
+        try:
+            if self.state.get("pending_upgrade"):
+                return self.reconcile_power_upgrade(profile)
+            now = time.time()
+            if now < number(self.state.get("upgrade_retry_at", 0), "upgrade retry time"):
+                return False
+            if not force and now < number(self.state.get("upgrade_check_at", 0), "upgrade check time"):
+                return False
+            power = number(profile.get("miningPower"), "miningPower")
+            balance = as_object(self.api.request("GET", "/user/balance"))
+            gems = number(balance.get("gems"), "gems")
+            upgrades = as_records(self.api.request("GET", "/upgrades"), "upgrades")
+            candidates = []
+            for upgrade in upgrades:
+                if (upgrade.get("type") or upgrade.get("stat")) != "miningPower":
+                    continue
+                # The current station prices upgrades in GEMS. If a future
+                # catalog explicitly names another currency, never buy it.
+                if any(
+                    field in upgrade and (
+                        not isinstance(upgrade[field], str)
+                        or upgrade[field].strip().upper() != "GEMS"
+                    )
+                    for field in ("currency", "costCurrency", "paymentCurrency")
+                ):
+                    continue
+                if any(upgrade.get(flag) is False for flag in ("isActive", "isUnlocked", "unlocked")):
+                    continue
+                cost = number(upgrade.get("cost"), "upgrade cost")
+                increment = number(upgrade.get("increment"), "upgrade increment")
+                if cost <= 0 or increment <= 0:
+                    raise ShapeError("Power upgrade cost and increment must be positive")
+                candidates.append((cost, item_id(upgrade)))
+            self.state["upgrade_check_at"] = now + UPGRADE_CHECK_SECONDS
+            if not candidates:
+                if self.upgrade_notice != ("unavailable",):
+                    LOG.info("%s no available power upgrade; mining continues", self.wallet["address"])
+                    self.upgrade_notice = ("unavailable",)
+                self.save()
+                return False
+            cost, upgrade_id = min(candidates)
+            if gems < cost:
+                notice = ("funds", gems, cost)
+                if self.upgrade_notice != notice:
+                    LOG.info("%s power upgrade waiting (gems=%g; cost=%g); mining continues", self.wallet["address"], gems, cost)
+                    self.upgrade_notice = notice
+                self.save()
+                return False
+            self.state["pending_upgrade"] = {
+                "upgrade_id": upgrade_id, "power_before": power,
+                "cost": cost, "gems_before": gems, "created_at": utc_now(),
+            }
+            try:
+                self.save()
+            except Exception:
+                # Nothing was sent: a failed prerequisite write is not a purchase.
+                self.state.pop("pending_upgrade", None)
+                raise
+            try:
+                self.api.request("POST", f"/upgrades/{quote(upgrade_id, safe='')}")
+            except ApiError as error:
+                if 400 <= error.status < 500:
+                    self.state.pop("pending_upgrade", None)
+                    self.save()
+                raise
+            # Even a 2xx remains pending until the new power is observed. This
+            # also prevents repeated spending against a stale profile response.
+            self.state["upgrade_check_at"] = 0
+            self.warned_pending_upgrade = False
+            self.upgrade_notice = None
+            LOG.info("%s power upgrade purchased (id=%s; cost=%g; gems_before=%g; power_before=%g); refreshing profile", self.wallet["address"], upgrade_id, cost, gems, power)
+            return True
+        except Stopped:
+            raise
+        except Exception as error:
+            self.defer_upgrade(error)
+            return False
+
     def cycle(self) -> float:
         me = as_object(self.api.request("GET", "/user/me"), "user")
         self.api.verify_referral(me)
@@ -529,37 +685,73 @@ class Miner:
         # Use the same live energy source the frontend prefers, not a local estimate.
         stats = as_object(self.api.request("GET", "/mining/stats"))
         energy = number(stats.get("energy", me.get("energy")), "energy")
+        profile = dict(me)
+        if "miningPower" in stats:
+            profile["miningPower"] = stats["miningPower"]
+        level = number(profile.get("level", 1), "level")
+        power = number(profile.get("miningPower", 0), "miningPower")
+        upgraded = self.upgrade_power(profile, force=bool(ready or quest_claimed))
+        if upgraded:
+            # Upgrades may award XP, but only the server decides the actual level.
+            # Read both sources again before choosing a newly eligible mine.
+            self.locations = None
+            try:
+                fresh_me = as_object(self.api.request("GET", "/user/me"), "user")
+                fresh_stats = as_object(self.api.request("GET", "/mining/stats"))
+                fresh_profile = dict(fresh_me)
+                if "miningPower" in fresh_stats:
+                    fresh_profile["miningPower"] = fresh_stats["miningPower"]
+                fresh_level = number(fresh_profile.get("level", 1), "level")
+                fresh_power = number(fresh_profile.get("miningPower", 0), "miningPower")
+                fresh_energy = number(fresh_stats.get("energy", fresh_me.get("energy")), "energy")
+                LOG.info("%s power upgrade profile refreshed (level=%g->%g; power=%g->%g)", self.wallet["address"], level, fresh_level, power, fresh_power)
+                profile, level, power, energy = fresh_profile, fresh_level, fresh_power, fresh_energy
+                self.reconcile_power_upgrade(profile)
+            except Stopped:
+                raise
+            except Exception as error:
+                # Retain the last valid snapshot and pending marker; keep mining.
+                self.defer_upgrade(error)
+                upgraded = False
         active = [p for p in positions if p["status"] not in {"claimed", "cancelled", "canceled"}]
+        occupied = len(active)
+        limit = getattr(self.args, "max_positions", None)
+        capacity_available = limit is None or occupied < limit
         now = time.monotonic()
         if now >= self.next_status_log:
             status = (
                 "pending_confirmation" if pending else
-                "waiting_energy" if energy < ENERGY_COST else
-                "positions_full" if len(active) >= MAX_POSITIONS else
+                "positions_full" if not capacity_available else
+                "waiting_energy" if energy <= 0 else
                 "checking_location"
             )
             # This is the server snapshot before any new deployment below.
-            LOG.info("%s mining check: energy=%g; occupied=%d/%d; status=%s", self.wallet["address"], energy, len(active), MAX_POSITIONS, status)
+            LOG.info("%s mining check: energy=%g; level=%g; power=%g; occupied=%d; limit=%s; status=%s", self.wallet["address"], energy, level, power, occupied, limit if limit is not None else "none", status)
             self.next_status_log = now + STATUS_LOG_INTERVAL
-        delay = self.args.interval
+        delay = 0.5 if upgraded else self.args.interval
         if pending:
             if not self.warned_pending:
                 LOG.warning("%s deployment result unknown; new openings paused until a new position appears. See --clear-pending", self.wallet["address"])
                 self.warned_pending = True
-        elif energy >= ENERGY_COST and len(active) < MAX_POSITIONS:
-            if self.locations is None or time.time() >= self.locations_at:
+        elif energy > 0 and capacity_available:
+            eligibility = (level, power)
+            if self.locations is None or time.time() >= self.locations_at or self.locations_profile != eligibility:
                 self.locations = as_records(self.api.request("GET", "/mining/locations"), "locations")
-                self.locations_at = time.time() + 1800
+                self.locations_at = time.time() + LOCATION_CACHE_SECONDS
+                self.locations_profile = eligibility
                 self.warned_no_location = False
-            location = choose_location(self.locations, me, self.args.location_id)
+            location = choose_location(self.locations, profile, self.args.location_id, energy)
             if location is None:
                 if not self.warned_no_location:
-                    LOG.warning("%s no eligible 5-energy/60-second location; not opening a more expensive mine", self.wallet["address"])
+                    LOG.warning("%s no unlocked affordable location (level=%g; power=%g; energy=%g); keeping claims and quests active", self.wallet["address"], level, power, energy)
                     self.warned_no_location = True
             else:
+                location_id = item_id(location)
+                cost = number(location["energyCost"], "energyCost")
+                duration = location_duration(location)
                 self.state["pending_open"] = {
                     "before_ids": [item_id(p) for p in positions],
-                    "created_at": utc_now(), "location_id": item_id(location),
+                    "created_at": utc_now(), "location_id": location_id,
                 }
                 try:
                     self.save()
@@ -578,12 +770,14 @@ class Miner:
                 # Acknowledged success. Transport errors/5xx keep pending_open for readback.
                 self.state.pop("pending_open", None)
                 self.state["last_opened_at"] = utc_now()
+                self.state["last_location_id"] = location_id
                 self.save()
-                LOG.info("%s miner deployed (energy=%g; occupied=%d)", self.wallet["address"], energy, len(active) + 1)
+                occupied += 1
+                LOG.info("%s miner deployed (location=%s; level_required=%g; power_required=%g; cost=%g; duration=%gs; energy_before=%g; occupied=%d)", self.wallet["address"], location_id, number(location.get("levelRequired", 1), "levelRequired"), number(location.get("miningPowerRequired", 0), "miningPowerRequired"), cost, duration, energy, occupied)
                 delay = 0.5
         self.state["last_cycle_at"] = utc_now()
         self.state["last_energy"] = energy
-        self.state["last_occupied"] = len(active)
+        self.state["last_occupied"] = occupied
         self.save()
         if not self.args.skip_quests:
             now = time.time()
@@ -678,16 +872,22 @@ def run_client(args, stop: threading.Event) -> int:
     with directory_lock(folder):
         secure_directory(folder / "state")
         # Maintenance must not accidentally create a new vault or extra wallets.
-        if args.clear_pending:
-            if not re.fullmatch(r"0x[0-9a-fA-F]{40}", args.clear_pending):
+        clear_upgrade = getattr(args, "clear_pending_upgrade", None)
+        if args.clear_pending is not None or clear_upgrade is not None:
+            address = args.clear_pending if args.clear_pending is not None else clear_upgrade
+            if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
                 raise WalletPaused("Invalid wallet address")
-            path = folder / "state" / (args.clear_pending.lower() + ".json")
+            path = folder / "state" / (address.lower() + ".json")
             if not path.is_file():
                 raise WalletPaused("No matching wallet state")
             state = read_json(path)
-            state.pop("pending_open", None)
+            marker = "pending_open" if args.clear_pending is not None else "pending_upgrade"
+            state.pop(marker, None)
+            if clear_upgrade is not None:
+                state.pop("upgrade_check_at", None)
+                state.pop("upgrade_retry_at", None)
             write_json(path, state)
-            LOG.info("Pending deployment marker cleared for %s", args.clear_pending)
+            LOG.info("Pending %s marker cleared for %s", "deployment" if args.clear_pending is not None else "upgrade", address)
             return 0
         if args.init_only:
             wallets = ensure_wallets(folder, args.wallets or 100, args.wallet_file)
@@ -696,6 +896,7 @@ def run_client(args, stop: threading.Event) -> int:
         # Runtime is strictly read-only with respect to the wallet vault.
         wallets = load_wallets(args.wallet_file)
         LOG.info("Loaded %d wallets from %s; no wallets will be generated", len(wallets), args.wallet_file)
+        LOG.info("Auto power upgrades %s; when enabled, available GEMS are spent on miningPower only", "disabled" if getattr(args, "skip_upgrades", False) else "enabled")
         request_stop = threading.Event()
         gate = RequestGate(args.request_interval, request_stop)
         miners = [Miner(wallet, folder, gate, args) for wallet in wallets]
@@ -712,16 +913,26 @@ def main(argv=None) -> int:
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--interval", type=float, default=15, help="Minimum idle poll interval per wallet")
     parser.add_argument("--request-interval", type=float, default=0.25, help="Global minimum seconds between API requests")
-    parser.add_argument("--location-id", help="Optional location ID; still requires 5 energy / 60 seconds")
+    parser.add_argument("--location-id", help="Only deploy to this location; still requires sufficient level, power and energy")
+    parser.add_argument("--max-positions", type=int, help="Optional per-wallet client cap; by default no client-side position cap")
     parser.add_argument("--skip-quests", action="store_true")
+    parser.add_argument("--skip-upgrades", action="store_true", help="Disable automatic GEMS spending on miningPower upgrades (enabled by default)")
     parser.add_argument("--init-only", action="store_true", help="Create local wallet file without any network requests")
     parser.add_argument("--resume", action="store_true", help="Compatibility option; failed wallets now retry automatically")
-    parser.add_argument("--clear-pending", metavar="ADDRESS", help="After manual server-side verification, clear one uncertain deployment and exit")
+    maintenance_options = parser.add_mutually_exclusive_group()
+    maintenance_options.add_argument("--clear-pending", metavar="ADDRESS", help="After manual server-side verification, clear one uncertain deployment and exit")
+    maintenance_options.add_argument("--clear-pending-upgrade", metavar="ADDRESS", help="After manual server-side verification, clear one uncertain power purchase and exit")
     args = parser.parse_args(argv)
+    for option in ("clear_pending", "clear_pending_upgrade"):
+        address = getattr(args, option)
+        if address is not None and not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+            parser.error(f"--{option.replace('_', '-')} requires a valid wallet address")
     if (args.wallets is not None and not 1 <= args.wallets <= 10000) or not 1 <= args.workers <= 20:
         parser.error("--wallets must be 1..10000; --workers must be 1..20")
     if args.wallets is not None and not args.init_only:
         parser.error("--wallets is only for generation with --init-only; runtime reads all wallets in --wallet-file")
+    if args.max_positions is not None and args.max_positions <= 0:
+        parser.error("--max-positions must be a positive integer; omit it for no client-side cap")
     if not math.isfinite(args.interval) or args.interval < 15 or not math.isfinite(args.request_interval) or args.request_interval < 0.1:
         parser.error("--interval must be >=15; --request-interval must be >=0.1")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[WindowLogHandler()])
@@ -736,7 +947,7 @@ def main(argv=None) -> int:
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), request_shutdown)
     args.wallet_file = args.wallet_file.expanduser().resolve()
-    maintenance = bool(args.init_only or args.clear_pending)
+    maintenance = args.init_only or args.clear_pending is not None or args.clear_pending_upgrade is not None
     while not stop.is_set():
         try:
             result = run_client(args, stop)
